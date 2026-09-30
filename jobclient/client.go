@@ -72,6 +72,35 @@ func (c *Client) Register(ctx context.Context, ep Endpoint) error {
 	return nil
 }
 
+// Deregister tells heain-job this module no longer owns strategyName,
+// so the very next Lookup against it fails immediately (ErrNotRegistered)
+// instead of waiting out the up-to-30s staleness TTL. This is a pure
+// latency optimization for a graceful shutdown -- never required for
+// correctness, since a module that crashes without calling this simply
+// goes stale on the existing TTL path and is handled identically.
+func (c *Client) Deregister(ctx context.Context, strategyName string) error {
+	buf, err := json.Marshal(map[string]string{"strategy_name": strategyName})
+	if err != nil {
+		return fmt.Errorf("jobclient: encoding deregistration: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.JobBaseURL+"/deregister", bytes.NewReader(buf))
+	if err != nil {
+		return fmt.Errorf("jobclient: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("jobclient: deregister request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("jobclient: /deregister returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // KeepRegistered registers ep once, then re-registers every interval
 // (heain-job treats each re-registration as a heartbeat, refreshing the
 // registry's staleness TTL) until ctx is canceled. Run it in its own
