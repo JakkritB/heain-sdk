@@ -14,7 +14,7 @@ Layer 3 Application Profile module (`heain-job`, `heain-image`,
   only knows how to *call* it over the network, the same way any
   external client of a public HTTP API would.
 
-Every Layer 3 module repo under [Heain-apps](https://github.com/Heain-apps)
+Every Layer 3 module repo under [heainframework](https://github.com/heainframework)
 imports this package instead of writing its own client, so the client
 code is written once and the wire contract stays consistent across every
 module.
@@ -22,7 +22,7 @@ module.
 ## Usage
 
 ```go
-import "github.com/Heain-apps/heain-sdk/coreclient"
+import "github.com/heainframework/heain-sdk/coreclient"
 
 client, err := coreclient.New("https://your-heain-core-node:8443", coreclient.TLSConfig{
     ClientCertFile: "dev-client.crt",
