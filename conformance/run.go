@@ -2,9 +2,11 @@ package conformance
 
 import (
 	"bytes"
+
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/heainframework/heain-sdk/manifest"
 	"io"
 	"log"
 	"net"
@@ -39,6 +41,7 @@ type runner struct {
 	cores  map[string]*proc
 	coreA  map[string][]string
 	app    *proc
+	deps   []*proc
 	proxy  *scanProxy
 	logs   string
 }
@@ -132,6 +135,29 @@ func (r *runner) build(ctx context.Context) error {
 		}
 	}
 	copyFile(filepath.Join(r.o.AppDir, r.conf.Manifest), filepath.Join(r.shared, "app", "heain-app.yaml"))
+	for i, cd := range r.conf.Companions {
+		dir := filepath.Join(r.o.AppDir, cd)
+		cc, err := LoadConf(dir)
+		if err != nil {
+			return fmt.Errorf("companion %s: %w", cd, err)
+		}
+		m, err := manifest.Load(filepath.Join(dir, cc.Manifest))
+		if err != nil {
+			return fmt.Errorf("companion %s: %w", cd, err)
+		}
+		if len(cc.Build) > 0 {
+			var env []string
+			if v := os.Getenv("SDK_GOWORK"); v != "" {
+				env = append(env, "GOWORK="+v, "GOFLAGS=")
+			}
+			r.logf("building companion %s: %s", m.App.ID, strings.Join(cc.Build, " "))
+			if out, err := r.sh(ctx, dir, env, cc.Build); err != nil {
+				return fmt.Errorf("companion %s build: %v\n%s", cd, err, out)
+			}
+		}
+		r.conf.Deps = append(r.conf.Deps, Dep{Dir: dir, AppID: m.App.ID, Instance: fmt.Sprintf("d%d", i+1), Port: r.conf.Port + 10 + i,
+			Manifest: filepath.Join(dir, cc.Manifest), Start: cc.Start})
+	}
 	raw, _ := json.Marshal(r.conf)
 	return os.WriteFile(filepath.Join(r.shared, "app", "conformance.json"), raw, 0o644)
 }
@@ -287,6 +313,10 @@ func (r *runner) runPhase(ctx context.Context, phase string) error {
 	r.logf("phase %s: starting", phase)
 	defer func() {
 		r.app.stop(30 * time.Second)
+		for _, p := range r.deps {
+			p.stop(30 * time.Second)
+		}
+		r.deps = nil
 		for _, p := range r.cores {
 			p.stop(15 * time.Second)
 		}
@@ -387,6 +417,19 @@ func (r *runner) action(action string, args map[string]string, appEnv []string) 
 			return HostResult{Out: err.Error(), Exit: 1}
 		}
 		r.app = p
+		return HostResult{OK: true}
+	case "deps_start":
+		for _, dp := range r.conf.Deps {
+			port := strconv.Itoa(dp.Port)
+			env := append(append([]string{}, appEnv...), "HEAIN_MANIFEST="+dp.Manifest, "HEAIN_INSTANCE="+dp.Instance,
+				"HEAIN_STATE_DIR="+r.dir(dp.Instance+"-state"), "HEAIN_ENROLL_TOKEN="+filepath.Join(r.shared, "enroll", dp.Instance+".json"),
+				"HEAIN_ENDPOINT_BASE=https://127.0.0.1:"+port, "HEAIN_LISTEN=127.0.0.1:"+port)
+			p, err := r.spawn(dp.AppID+"-"+dp.Instance, dp.Dir, env, dp.Start)
+			if err != nil {
+				return HostResult{Out: err.Error(), Exit: 1}
+			}
+			r.deps = append(r.deps, p)
+		}
 		return HostResult{OK: true}
 	case "app_stop":
 		r.app.stop(30 * time.Second)

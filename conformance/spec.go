@@ -35,6 +35,25 @@ type Conf struct {
 	Jobs []JobCase `yaml:"jobs,omitempty" json:"jobs,omitempty"`
 	P5   *P5Case   `yaml:"p5,omitempty" json:"p5,omitempty"`
 	P7   *P7Case   `yaml:"p7,omitempty" json:"p7,omitempty"`
+	// Companions are other apps the app needs in order to work (for
+	// example the module heain-job orchestrates), each a directory with
+	// its own conformance.yaml (build, start, manifest), relative to the
+	// app directory. They are built, enrolled and started alongside the
+	// app but are not under test.
+	Companions []string `yaml:"companions,omitempty" json:"companions,omitempty"`
+	// Deps is filled in by the runner (not read from YAML).
+	Deps []Dep `yaml:"-" json:"deps,omitempty"`
+}
+
+// Dep is a companion app as the runner started it.
+type Dep struct {
+	Dir      string   `json:"dir"`
+	AppID    string   `json:"app_id"`
+	Instance string   `json:"instance"`
+	Port     int      `json:"port"`
+	Manifest string   `json:"manifest"`
+	Build    []string `json:"build,omitempty"`
+	Start    []string `json:"start"`
 }
 
 // Call is one request to the app under test.

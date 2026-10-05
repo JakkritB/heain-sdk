@@ -176,17 +176,7 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 }
 
 func (a *App) declares(app, capability string) bool {
-	for _, u := range a.Manifest.Uses {
-		if u.App != app {
-			continue
-		}
-		for _, c := range u.Capabilities {
-			if c == capability {
-				return true
-			}
-		}
-	}
-	return false
+	return a.Manifest.DependsOn(app, capability)
 }
 
 // appClient is an mTLS client that accepts only the app instance want

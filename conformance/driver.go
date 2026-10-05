@@ -543,3 +543,27 @@ func RemoteClaim(shared, coreURL string) (int, string, error) { // coreURL: core
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(b), nil
 }
+
+// startDeps enrolls and starts the companion apps (not under test) and
+// waits until core admits them.
+func (d *Driver) startDeps(enrollBase, enrollNode, base, node string) bool {
+	if len(d.Conf.Deps) == 0 {
+		return true
+	}
+	for _, dp := range d.Conf.Deps {
+		if err := d.enrollToken(enrollBase, enrollNode, dp.AppID+"."+dp.Instance, filepath.Join(d.Shared, "enroll", dp.Instance+".json")); err != nil {
+			log.Printf("driver: companion token: %v", err)
+			return false
+		}
+	}
+	d.host("deps_start", nil)
+	return waitFor(120*time.Second, func() bool {
+		d.approveWaiting(base, node, "app.register")
+		for _, dp := range d.Conf.Deps {
+			if d.appStatus(base, node, dp.AppID, dp.Instance) != "active" {
+				return false
+			}
+		}
+		return true
+	})
+}

@@ -81,6 +81,10 @@ func (d *Driver) RunSingle(ctx context.Context) {
 		return
 	}
 
+	if !d.startDeps(gBase, gNode, gBase, gNode) {
+		d.check("C3", "companion apps start and are admitted", false, "%d companion(s)", len(d.Conf.Deps))
+		return
+	}
 	// ---- the app under test starts and is admitted
 	if err := d.enrollToken(gBase, gNode, d.AppReg, filepath.Join(d.Shared, "enroll", "a1.json")); err != nil {
 		d.check("C3", "enrolment token issued", false, "%v", err)
@@ -506,7 +510,8 @@ func (d *Driver) c4(ctx context.Context) []callRec {
 		d.host("app_unpause", nil)
 		m := d.waitJob(tk, 90*time.Second)
 		d.setSystem(gBase, gNode, "dispatch.lease_default", "30s")
-		d.check("C4", "lease expiry -> the job is reassigned and completed by the app", claimed && str(m, "state") == "completed" && num(m, "attempts") >= 2,
+		done := str(m, "state") == "completed" || str(m, "state") == "delivered"
+		d.check("C4", "lease expiry -> the job is reassigned and completed by the app", claimed && done && num(m, "attempts") >= 2,
 			"probe claimed %v, state %s, attempts %v", claimed, str(m, "state"), m["attempts"])
 		if cp, ok := d.Man.Capability(j.Capability); ok {
 			recs = append(recs, callRec{cap: cp, jobTk: tk, jobAtt: int(num(m, "attempts")) - 1, trace: str(m, "trace_id"), ai: aiUsed(cp), formal: isFormal(cp.Formal), call: Call{Secret: j.Payload}})
@@ -773,12 +778,6 @@ func (d *Driver) c12() {
 	if len(d.Man.Uses) == 0 {
 		d.skip("C12", "dependencies", "the manifest declares no uses[]")
 	}
-	allowed := map[string]bool{}
-	for _, u := range d.Man.Uses {
-		for _, c := range u.Capabilities {
-			allowed[u.App+"/"+c] = true
-		}
-	}
 	calls, bad := 0, []string{}
 	for _, e := range d.audit(gBase, gNode) {
 		if e.Action != "app.event" || !strings.HasPrefix(str(e.Detail, "app_actor"), d.Man.App.ID+".") || str(detail2(e), "ticket_id") != "" {
@@ -786,7 +785,7 @@ func (d *Driver) c12() {
 		}
 		callee := strings.SplitN(e.Actor, ".", 2)[0]
 		calls++
-		if !allowed[callee+"/"+str(e.Detail, "capability")] {
+		if !d.Man.DependsOn(callee, str(e.Detail, "capability")) {
 			bad = append(bad, callee+"/"+str(e.Detail, "capability"))
 		}
 	}

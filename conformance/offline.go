@@ -75,6 +75,10 @@ func (d *Driver) RunOffline(ctx context.Context) {
 		d.check("C10", "the driver's probe app is admitted on W", false, "%v", err)
 		return
 	}
+	if !d.startDeps(gBase2, gNode, wBase, wNode) {
+		d.check("C10", "companion apps start on W and are admitted", false, "%d companion(s)", len(d.Conf.Deps))
+		return
+	}
 	if err := d.enrollToken(gBase2, gNode, d.AppReg, filepath.Join(d.Shared, "enroll", "a1.json")); err != nil {
 		d.check("C10", "enrolment token issued by G", false, "%v", err)
 		return

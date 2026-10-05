@@ -150,14 +150,7 @@ func (a *App) RequestErasure(ctx context.Context, ticket string) error {
 }
 
 func (a *App) usesCapability(capability string) bool {
-	for _, u := range a.Manifest.Uses {
-		for _, c := range u.Capabilities {
-			if c == capability {
-				return true
-			}
-		}
-	}
-	return false
+	return a.Manifest.UsesCapability(capability)
 }
 
 // retryable: transport errors and core errors marked retryable (or 5xx);

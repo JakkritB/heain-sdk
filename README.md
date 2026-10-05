@@ -140,3 +140,8 @@ go build -o /tmp/heain-conformance ./conformance/cmd/heain-conformance
 - The app is controlled with signals: SIGTERM (graceful leave), SIGSTOP/SIGCONT (missed heartbeats), and a second start with a broken manifest (C1).
 - **C13:** a claim through this machine's LAN address is refused (`locality_violation`); in the offline phase every byte between W and G passes the suite's proxy, which looks for the test data in clear. **C10:** the proxy is cut and healed by the suite.
 - No Dockerfile is needed; `conformance/refapp` has none.
+
+## Step 4a: dependency patterns and companion apps (2026-10-06)
+
+- **`uses[]` patterns** (decided 2026-10-06 for orchestrators such as heain-job, which serve modules they cannot list in advance): `app` and each capability may contain `*`, e.g. `{app: "*", capabilities: ["*.split", "*.unit", "*.merge"]}`. `App.Call` and `App.Submit` match against them; the manifest check refuses anything but names and `*`. Conformance C12 uses the same matching.
+- **Conformance companions:** `conformance.yaml` may list `companions:` — directories of other apps the app under test needs (each with its own `conformance.yaml`). The suite builds, enrolls and starts them alongside the app (not under test), on the same node.

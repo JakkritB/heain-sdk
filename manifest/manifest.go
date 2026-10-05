@@ -79,10 +79,74 @@ type Endpoint struct {
 	Formal     *bool  `json:"formal" yaml:"formal"`
 }
 
+// Use is one declared dependency. App and each capability may be a
+// pattern where "*" stands for any run of characters (decided 2026-10-06
+// for orchestrators such as heain-job, which serve modules they cannot
+// list in advance): {app: "*", capabilities: ["*.split", "*.merge"]}.
 type Use struct {
 	App          string   `json:"app" yaml:"app"`
 	Capabilities []string `json:"capabilities" yaml:"capabilities"`
 }
+
+// Matches reports whether u declares capability of app.
+func (u Use) Matches(app, capability string) bool {
+	if !globMatch(u.App, app) {
+		return false
+	}
+	for _, c := range u.Capabilities {
+		if globMatch(c, capability) {
+			return true
+		}
+	}
+	return false
+}
+
+// DependsOn reports whether the manifest declares capability of app as a
+// dependency (exact names or patterns).
+func (m Manifest) DependsOn(app, capability string) bool {
+	for _, u := range m.Uses {
+		if u.Matches(app, capability) {
+			return true
+		}
+	}
+	return false
+}
+
+// UsesCapability reports whether any dependency entry covers capability
+// (for job submission, where core, not the caller, picks the provider).
+func (m Manifest) UsesCapability(capability string) bool {
+	for _, u := range m.Uses {
+		for _, c := range u.Capabilities {
+			if globMatch(c, capability) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// globMatch matches s against pattern, where "*" stands for any run of
+// characters (dots included).
+func globMatch(pattern, s string) bool {
+	if !strings.Contains(pattern, "*") {
+		return pattern == s
+	}
+	parts := strings.Split(pattern, "*")
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	for i := 1; i < len(parts)-1; i++ {
+		j := strings.Index(s, parts[i])
+		if j < 0 {
+			return false
+		}
+		s = s[j+len(parts[i]):]
+	}
+	return strings.HasSuffix(s, parts[len(parts)-1])
+}
+
+var usePatRe = regexp.MustCompile(`^[a-z0-9*]([a-z0-9._*-]*)$`)
 
 type DataClass struct {
 	Name            string    `json:"name" yaml:"name"`
@@ -299,6 +363,20 @@ func Validate(m Manifest) error {
 		for _, dc := range c.DataClasses {
 			if !dcs[dc] {
 				bad("capability %q uses undeclared data class %q", c.Name, dc)
+			}
+		}
+	}
+
+	for i, u := range m.Uses {
+		if u.App == "" || !usePatRe.MatchString(u.App) {
+			bad("uses[%d].app must be an app id or a pattern with *", i)
+		}
+		if len(u.Capabilities) == 0 {
+			bad("uses[%d] lists no capabilities", i)
+		}
+		for _, c := range u.Capabilities {
+			if !usePatRe.MatchString(c) {
+				bad("uses[%d] capability %q must be a capability name or a pattern with *", i, c)
 			}
 		}
 	}
