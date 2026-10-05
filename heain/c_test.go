@@ -409,3 +409,56 @@ func TestPolicyAndBroadcast(t *testing.T) {
 		t.Fatalf("broadcast: %+v %v", b, err)
 	}
 }
+
+// A capability not allowed offline is never served on a stale mode: the
+// server reads the mode again first (conformance C10).
+func TestFreshModeBeforeServing(t *testing.T) {
+	f := &fake3{}
+	p := testpki.New(t)
+	_, _, corePair := p.Issue(t, "core", "G")
+	f.done, f.mode = map[string]map[string]any{}, map[string]any{"mode": "normal"}
+	cs := httptest.NewUnstartedServer(http.HandlerFunc(f.h))
+	cs.TLS = &tls.Config{Certificates: []tls.Certificate{corePair}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: p.Pool()}
+	cs.StartTLS()
+	defer cs.Close()
+	cert, key, _ := p.IssueApp(t, "work", "work-app.w1")
+	mp := filepath.Join(t.TempDir(), "m.yaml")
+	_ = os.WriteFile(mp, []byte(workerManifest), 0o644)
+	a, err := Start(context.Background(), Options{ManifestPath: mp, InstanceID: "w1", StateDir: t.TempDir(), ModePoll: -1,
+		Core: core.Config{URL: cs.URL, NodeID: "G", CertFile: cert, KeyFile: key, CAFile: p.CAFile}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(context.Background())
+	srv := a.NewServer()
+	ok := func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }
+	_ = srv.HandleFunc("GET /v1/view", ok)
+	_ = srv.HandleFunc("GET /v1/offline", ok)
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx, l) }()
+	time.Sleep(50 * time.Millisecond)
+	cl, _ := a.appClient("work-app.w1")
+	get := func(path string) int {
+		resp, err := cl.Get("https://" + l.Addr().String() + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if get("/v1/view") != 200 {
+		t.Fatal("normal: served")
+	}
+	f.mu.Lock()
+	f.mode = map[string]any{"mode": "standalone"}
+	f.mu.Unlock()
+	time.Sleep(ModeFreshness + 100*time.Millisecond) // polling is off: only the freshness check can see it
+	if c := get("/v1/view"); c != 409 {
+		t.Fatalf("not allowed offline, standalone just now: %d, want 409", c)
+	}
+	if c := get("/v1/offline"); c != 200 {
+		t.Fatalf("allowed offline: %d", c)
+	}
+}

@@ -1,0 +1,48 @@
+# conformance-ref: the heain-sdk reference app. It uses every App API feature
+# the conformance suite (spec 05) checks, and passes C1-C14.
+manifest_version: 1
+app:
+  id: conformance-ref
+  version: 1.0.0
+  group: domain
+  description: Reference app for the heain conformance suite.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: ref.greet, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [ref_text]}
+  - name: ref.score
+    version: 1
+    formal: true
+    execution: direct
+    ai: {used: true, model: {name: ref-rules, version: "1"}, reasoning_record: required}
+    data_classes: [ref_text]
+  - {name: ref.id, version: 1, formal: true, execution: direct, lane: identity, ai: {used: false}}
+  - {name: ref.ballot, version: 1, formal: true, execution: direct, lane: ballot, ai: {used: false}}
+  - {name: ref.upper, version: 1, formal: true, execution: job, ai: {used: false}, data_classes: [ref_text]}
+  - name: ref.label
+    version: 1
+    formal: true
+    execution: job
+    ai: {used: true, model: {name: ref-rules, version: "1"}}
+  - {name: ref.propose, version: 1, formal: true, execution: direct, ai: {used: false}}
+  - {name: ref.broadcast, version: 1, formal: true, execution: direct, ai: {used: false}}
+  - {name: ref.relay, version: 1, formal: true, execution: direct, ai: {used: false}}
+endpoints:
+  - {method: POST, path: /v1/greet, capability: ref.greet, formal: true}
+  - {method: GET, path: "/v1/greet/{name}", capability: ref.greet, formal: false}
+  - {method: POST, path: /v1/score, capability: ref.score, formal: true}
+  - {method: POST, path: /v1/id, capability: ref.id, formal: true}
+  - {method: POST, path: /v1/ballot, capability: ref.ballot, formal: true}
+  - {method: POST, path: /v1/propose, capability: ref.propose, formal: true}
+  - {method: GET, path: "/v1/propose/{id}", capability: ref.propose, formal: false}
+  - {method: POST, path: /v1/broadcast, capability: ref.broadcast, formal: true}
+  - {method: POST, path: /v1/relay, capability: ref.relay, formal: true}
+uses:
+  - {app: conformance-ref, capabilities: [ref.greet]}
+data_classes:
+  - {name: ref_text, sovereignty: zone-local, retention: {max: 30d}, encrypted_at_rest: true}
+lanes:
+  unlinkable: [[identity, ballot]]
+offline:
+  allowed: [ref.greet, ref.upper]
+  journal: required

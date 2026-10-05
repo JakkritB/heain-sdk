@@ -68,6 +68,7 @@ type App struct {
 
 	modeMu   sync.Mutex
 	mode     Mode
+	modeAt   time.Time
 	modeSubs []func(old, cur Mode)
 	modeDone chan struct{}
 	seqMu    sync.Mutex // journal app_seq counter

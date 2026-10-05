@@ -58,6 +58,7 @@ func (a *App) OnModeChange(f func(old, cur Mode)) {
 
 func (a *App) setMode(m Mode) {
 	a.modeMu.Lock()
+	a.modeAt = time.Now()
 	old := a.mode
 	changed := old.Mode != m.Mode || (m.Standalone() && (!sameStrings(old.DenyCapabilities, m.DenyCapabilities) || old.Overdue != m.Overdue))
 	a.mode = m
@@ -130,4 +131,41 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ModeFreshness bounds how old the cached mode may be when a capability
+// that is not allowed offline is about to be served: an older one is read
+// again from core first, so such a capability is never served for a poll
+// interval after the node went standalone (conformance C10).
+var ModeFreshness = time.Second
+
+// allowedFresh is AllowedNow with that check.
+func (a *App) allowedFresh(ctx context.Context, capability string) bool {
+	if a.allowedOffline(capability) {
+		return a.AllowedNow(capability)
+	}
+	a.modeMu.Lock()
+	stale := time.Since(a.modeAt) > ModeFreshness
+	a.modeMu.Unlock()
+	if stale {
+		c, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, _ = a.FetchMode(c)
+		cancel()
+	}
+	return a.AllowedNow(capability)
+}
+
+// allowedOffline reports whether the manifest lets capability run while
+// standalone (the admin's deny list aside).
+func (a *App) allowedOffline(capability string) bool {
+	off := a.Manifest.Offline
+	if off == nil || off.Allowed == nil {
+		return true
+	}
+	for _, c := range off.Allowed {
+		if c == capability {
+			return true
+		}
+	}
+	return false
 }

@@ -1,0 +1,22 @@
+# Test inputs for heain-conformance (spec 05; author decision 2026-10-05).
+manifest: heain-app.yaml
+# run in this directory before `docker build` (CGO_ENABLED=0 is set)
+prebuild: [go, build, -o, refapp, .]
+port: 19443
+endpoints:
+  - {method: POST, path: /v1/greet, body: {name: ann}, expect: 200}
+  - {method: GET, path: /v1/greet/bob, expect: 200}
+  - {method: POST, path: /v1/score, body: {text: "conformance-secret-score!!"}, expect: 200, secret: conformance-secret-score}
+  - {method: POST, path: /v1/id, body: {}, expect: 200}
+  - {method: POST, path: /v1/ballot, body: {}, expect: 200}
+  - {method: POST, path: /v1/relay, body: {name: relay}, expect: 200}
+jobs:
+  - {capability: ref.upper, payload: conformance-secret-job, expect_output: CONFORMANCE-SECRET-JOB, delivery: STAGED}
+  - {capability: ref.label, payload: conformance-secret-label, delivery: IMMEDIATE}
+p5:
+  propose: {method: POST, path: /v1/propose, body: {}}
+  status: {method: GET, path: "/v1/propose/{action_id}"}
+  type: ref.grant.extend
+p7:
+  broadcast: {method: POST, path: /v1/broadcast, body: {}}
+  sensitive: [customer_id]

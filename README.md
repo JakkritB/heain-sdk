@@ -109,3 +109,19 @@ Known limit (core, by design): on a Worker node an app certificate is checked wi
 - Core's P3 `/execute` (the legacy `/ingest` path) now hands jobs to apps through the App API, so an SDK `Worker` also runs those jobs, with no change in the app.
 
 Live test: `bash scripts/live_3d.sh` (needs `~/heain-core`).
+
+## Step 3e-2: conformance suite (2026-10-06)
+
+An app is done only when it passes the conformance suite (spec 05):
+
+```
+go build -o /tmp/heain-conformance ./conformance/cmd/heain-conformance
+/tmp/heain-conformance run --app ./conformance/refapp --core ~/heain-core --out ./conformance-report
+```
+
+- **What it does:** builds heain-core and the harness from source (static), the app from its own `Dockerfile`, and runs them with Docker Compose. Every image is `FROM scratch`, so nothing is pulled. Phase *single* (one core node) runs C1–C9 and C11–C14; phase *offline* (G ← S1, G ← W through a proxy the driver cuts) runs C10. Exit code 0 = pass; `report.json`, `report.txt` and the containers' logs are written to `--out`.
+- **How the app is run — the container contract** (`heain.StartFromEnv`): the app reads `HEAIN_MANIFEST`, `HEAIN_INSTANCE`, `HEAIN_CORE_URL`, `HEAIN_CORE_ID`, `HEAIN_CA`, `HEAIN_STATE_DIR`, `HEAIN_ENDPOINT_BASE`, `HEAIN_LISTEN`, and enrolls through provisioning from `HEAIN_ENROLL_TOKEN` (+ `HEAIN_CHAIN`, `HEAIN_ENROLL_CORE_URL/ID`) when it has no certificate yet. The manifest is validated before enrolment. The app runs in its core's network namespace (C13: job claims only from the node).
+- **What the app ships — `conformance.yaml`** beside its manifest: `manifest`, optional `prebuild` (run before `docker build`, with `CGO_ENABLED=0`), `port`, one sample request per endpoint (`method`, `path`, `body`, `expect`, `secret`), one sample job per job capability (`capability`, `payload`, `expect_output`, `delivery`), and optional `p5` / `p7` triggers. See `conformance/refapp/`.
+- **Reference app `conformance/refapp`:** formal and non-formal endpoints, an AI endpoint and an AI job with signed records and a model hash, two unlinkable lanes, jobs, P5, P7, an app-to-app call through discovery, offline rules and its own journal events. It passes C1–C14.
+- **Found by C10 and fixed in the SDK:** an app learns the node's mode by polling (5 s), so right after a partition it could still serve a capability that is not allowed offline. The server now re-reads the mode from core first when its copy is older than `ModeFreshness` (1 s) — only for capabilities not allowed offline.
+- **Known gap reported by the suite:** C9 "data classes never leave their declared scope" is reported as *skip*: core does not filter discovery by zone yet.
