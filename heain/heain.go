@@ -38,6 +38,12 @@ type Options struct {
 	// (empty for job-only apps).
 	EndpointBase string
 	Core         core.Config
+	// StateDir holds the SDK's small durable state (the journal's app_seq
+	// counter). Default: the directory of Core.KeyFile.
+	StateDir string
+	// ModePoll is how often the node's mode (normal/standalone) is read
+	// from core (default 5 s; < 0 disables, then Mode is read on demand only).
+	ModePoll time.Duration
 	// Logf receives the SDK's own log lines (default log.Printf).
 	Logf func(format string, a ...any)
 }
@@ -59,6 +65,12 @@ type App struct {
 	done    chan struct{}
 	logf    func(string, ...any)
 	closed  bool
+
+	modeMu   sync.Mutex
+	mode     Mode
+	modeSubs []func(old, cur Mode)
+	modeDone chan struct{}
+	seqMu    sync.Mutex // journal app_seq counter
 }
 
 // ErrIdentity is returned when the certificate's CN is not <app-id>.<instance-id>.
@@ -121,7 +133,13 @@ func Start(ctx context.Context, o Options) (*App, error) {
 	a := &App{Manifest: m, Core: c, Instance: o.InstanceID, reg: reg, stop: make(chan struct{}), done: make(chan struct{}), logf: logf,
 		opts: o, pair: pair, key: pair.PrivateKey}
 	logf("heain-sdk: %s registered with core %s (%s), status %s", want, info.NodeID, info.CoreVersion, reg.Status)
+	a.mode = Mode{Mode: ModeNormal}
+	if info.Mode != "" {
+		a.mode.Mode = info.Mode
+	}
+	a.modeDone = make(chan struct{})
 	go a.heartbeat()
+	go a.watchMode()
 	return a, nil
 }
 
@@ -211,5 +229,6 @@ func (a *App) Close(ctx context.Context) error {
 	a.mu.Unlock()
 	close(a.stop)
 	<-a.done
+	<-a.modeDone
 	return a.Core.Deregister(ctx)
 }

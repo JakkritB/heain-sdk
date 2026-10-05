@@ -36,6 +36,7 @@ type Config struct {
 type Client struct {
 	base string
 	hc   *http.Client
+	lp   *http.Client // long polls: no client timeout, bounded by ctx
 	cfg  Config
 }
 
@@ -48,8 +49,9 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
+	tr := &http.Transport{TLSClientConfig: tc}
 	return &Client{base: strings.TrimSuffix(cfg.URL, "/"), cfg: cfg,
-		hc: &http.Client{Timeout: cfg.Timeout, Transport: &http.Transport{TLSClientConfig: tc}}}, nil
+		hc: &http.Client{Timeout: cfg.Timeout, Transport: tr}, lp: &http.Client{Transport: tr}}, nil
 }
 
 // TLSConfig is the client side of the SDK's mTLS: TLS 1.3 only, the given
@@ -106,6 +108,16 @@ func IsCode(err error, code string) bool {
 // JSON response into out (nil = ignore). It returns the HTTP status.
 // Unknown response fields are ignored (spec 05 C11).
 func (c *Client) Do(ctx context.Context, method, path string, hdr http.Header, body, out any) (int, error) {
+	return c.do(c.hc, ctx, method, path, hdr, body, out)
+}
+
+// LongPoll is Do without the per-call timeout, for long polls (job claim);
+// ctx bounds it.
+func (c *Client) LongPoll(ctx context.Context, method, path string, body, out any) (int, error) {
+	return c.do(c.lp, ctx, method, path, nil, body, out)
+}
+
+func (c *Client) do(hc *http.Client, ctx context.Context, method, path string, hdr http.Header, body, out any) (int, error) {
 	var rd io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -124,7 +136,7 @@ func (c *Client) Do(ctx context.Context, method, path string, hdr http.Header, b
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, err
 	}

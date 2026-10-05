@@ -84,3 +84,20 @@ Live test: `bash scripts/live_3a.sh` runs against a real heain-core node and nee
 Live test: `bash scripts/live_3b.sh` (needs `~/heain-core`).
 
 Known limit: the app-side server checks that the caller's certificate chains to the deployment CA and is an app certificate, but not core's revocation list; core's own endpoints do check it.
+
+## Step 3c: jobs, P5, P7, offline mode and journal (2026-10-05)
+
+| API (package `heain`) | What it does |
+|---|---|
+| `App.Submit(ctx, JobRequest)` | Submits a job for an `execution: job` capability (P1). The capability must be declared in `uses[]` (checked before any call). A transient failure is retried with the same `Idempotency-Key`, so the job is queued at most once. |
+| `App.Job`, `App.WaitJob`, `App.ConfirmRetrieval`, `App.RequestErasure` | Status and output (submitter only); P4 disposal and erasure. |
+| `App.NewWorker`, `Worker.Handle(capability, handler)`, `Worker.Run` | The pull model: claims jobs from the core on the app's own node (long poll), runs the handler under the lease (ctx ends with it; the payload is zeroed afterwards), then completes or fails. `Permanent(err)` = not retryable; any other error is retried by core (`p3.max_retry`, then the Approver). For a formal capability **each attempt is audited once**; if the event cannot be written the attempt fails (retryable) instead of delivering. An AI capability that requires a record and has none fails with `reasoning_record_missing`. A handler panic fails the attempt (retryable). |
+| `App.Propose`, `App.PolicyStatus`, `App.WaitPolicy` | P5 for app-defined actions: `AUTO_APPROVED`, `WAITING_APPROVAL` → `APPROVED` / `DENIED`. Thresholds are policy, never set by the app. |
+| `App.Broadcast` | P7 discovery, always through P5 (`KNOWLEDGE_UPDATE`); core sanitizes an approved payload. |
+| `App.FetchMode`, `App.CurrentMode`, `App.OnModeChange`, `App.AllowedNow` | The node's mode (`normal` / `standalone`, polled every 5 s by default) and a callback on change. While standalone, `AllowedNow` follows core: the manifest's `offline.allowed` (absent = all) minus the admin's `offline.policy` deny list. The server refuses other capabilities (`409 standalone_not_allowed`, audited) and the Worker does not claim them. |
+| `App.Journal(ctx, kind, lane, data)`, `App.JournalProgress` | The app's own domain events in the node's offline journal. `app_seq` comes from a durable counter in `Options.StateDir` (default: the key file's directory), reserved before sending: a retry reuses its number, a restart never does. Formal calls need no journal call: core journals their audit events while standalone. |
+| `examples/worker`, `examples/ops` | A job worker (text.upper allowed offline, text.tone with AI records) and a command-line app for jobs, P5, P7, mode and journal. |
+
+Live test: `bash scripts/live_3c.sh` (needs `~/heain-core`, ~6 min).
+
+Known limit (core, by design): on a Worker node an app certificate is checked with the Master; cut off, the node falls back to its escrowed copy of the Master's state (`escrow.sync_interval`, default 10 s). An app enrolled less than that before a partition cannot work on the island.

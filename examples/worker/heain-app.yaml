@@ -1,0 +1,25 @@
+# worker-app: runs jobs (pull model) -- heain-sdk step 3c example.
+manifest_version: 1
+app:
+  id: worker-app
+  version: 1.0.0
+  group: domain
+  description: Upper-cases text and rates its tone, as jobs.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - name: text.upper
+    version: 1
+    formal: true
+    execution: job
+    ai: {used: false}
+  - name: text.tone
+    version: 1
+    formal: true
+    execution: job
+    ai:
+      used: true
+      model: {name: tone-rules, version: "1"}
+offline:
+  allowed: [text.upper]   # text.tone is not served while the node is standalone
+  journal: required

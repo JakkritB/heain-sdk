@@ -168,6 +168,11 @@ func (s *Server) wrap(ep manifest.Endpoint, c manifest.Capability, h http.Handle
 			detail["method"], detail["path"] = ep.Method, ep.Path
 			return s.app.auditEvent(r.Context(), trace, c.Lane, c.Name, caller, outcome, detail)
 		}
+		if !s.app.AllowedNow(c.Name) {
+			_ = audit("refused:standalone_not_allowed", map[string]any{})
+			writeErr(w, http.StatusConflict, "standalone_not_allowed", "this node is standalone and "+c.Name+" is not allowed offline (manifest offline.allowed or the admin's offline policy)")
+			return
+		}
 		if c.Lane != "" && lane != c.Lane {
 			trace = NewID() // a refused id must not be linked into this lane's audit
 			_ = audit("refused:lane_violation", map[string]any{"lane_sent": lane})
