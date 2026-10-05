@@ -34,6 +34,10 @@ type fake3 struct {
 	journal   []map[string]any
 	mode      map[string]any
 	polls     int
+	lastSub   map[string]any
+	extends   int
+	refuseExt bool
+	lease     time.Duration // lease granted by claim (default 1 min)
 }
 
 func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +73,7 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"record_id":"` + body["record_id"].(string) + `"}`))
 	case p == "/v1/app/jobs":
 		f.submits = append(f.submits, r.Header.Get("Idempotency-Key"))
+		f.lastSub = body
 		if busy() {
 			return
 		}
@@ -85,7 +90,11 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 			for _, c := range cs {
 				if j["capability"] == c {
 					f.jobs = append(f.jobs[:i], f.jobs[i+1:]...)
-					j["lease_id"], j["lease_expires_at"] = "L-"+j["ticket_id"].(string), time.Now().Add(time.Minute)
+					lease := f.lease
+					if lease == 0 {
+						lease = time.Minute
+					}
+					j["lease_id"], j["lease_expires_at"] = "L-"+j["ticket_id"].(string), time.Now().Add(lease)
 					_ = json.NewEncoder(w).Encode(j)
 					return
 				}
@@ -95,6 +104,14 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		f.mu.Lock()
 		w.WriteHeader(204)
+	case strings.HasPrefix(p, "/v1/app/jobs/") && strings.HasSuffix(p, "/extend"):
+		f.extends++
+		if f.refuseExt {
+			w.WriteHeader(409)
+			_, _ = w.Write([]byte(`{"error":{"code":"lease_expired","message":"no","retryable":false}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease_expires_at": time.Now().Add(time.Duration(body["seconds"].(float64)) * time.Second)})
 	case strings.HasPrefix(p, "/v1/app/jobs/") && (strings.HasSuffix(p, "/complete") || strings.HasSuffix(p, "/fail")):
 		parts := strings.Split(p, "/")
 		body["op"] = parts[5]
@@ -460,5 +477,62 @@ func TestFreshModeBeforeServing(t *testing.T) {
 	}
 	if c := get("/v1/offline"); c != 200 {
 		t.Fatalf("allowed offline: %d", c)
+	}
+}
+
+func TestSubmitMaxAttempts(t *testing.T) {
+	f := &fake3{}
+	a, _, _ := startFake3(t, f)
+	ctx := context.Background()
+	if _, err := a.Submit(ctx, JobRequest{Capability: "img.upscale", MaxAttempts: -1}); err == nil {
+		t.Fatal("negative MaxAttempts accepted")
+	}
+	if _, err := a.Submit(ctx, JobRequest{Capability: "img.upscale"}); err != nil || f.lastSub["max_attempts"] != nil {
+		t.Fatalf("default must not send max_attempts: %v %v", err, f.lastSub)
+	}
+	if _, err := a.Submit(ctx, JobRequest{Capability: "img.upscale", MaxAttempts: 1}); err != nil || f.lastSub["max_attempts"] != float64(1) {
+		t.Fatalf("max_attempts: %v %v", err, f.lastSub)
+	}
+}
+
+// A job longer than its lease keeps it through extensions; a refused
+// extension ends the job ctx when the lease runs out.
+func TestWorkerExtendsLease(t *testing.T) {
+	for _, refuse := range []bool{false, true} {
+		f := &fake3{lease: 1500 * time.Millisecond, refuseExt: refuse}
+		f.jobs = []map[string]any{{"ticket_id": "long", "capability": "img.note", "trace_id": "tr-l", "payload_b64": base64.StdEncoding.EncodeToString([]byte("x"))}}
+		a, _, _ := startFake3(t, f)
+		w := a.NewWorker()
+		_ = w.Handle("img.note", func(ctx context.Context, j *Job) ([]byte, error) {
+			select {
+			case <-time.After(4 * time.Second):
+				return []byte("done"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = w.Run(ctx) }()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			f.mu.Lock()
+			d := f.done["long"]
+			n := f.extends
+			f.mu.Unlock()
+			if d != nil {
+				if !refuse && (d["op"] != "complete" || n < 3) {
+					t.Fatalf("extended job: %v extends=%d", d, n)
+				}
+				if refuse && (d["op"] != "fail" || n != 1) {
+					t.Fatalf("refused extension: %v extends=%d", d, n)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("job not reported (refuse=%v)", refuse)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
 	}
 }

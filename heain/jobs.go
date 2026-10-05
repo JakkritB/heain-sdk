@@ -40,6 +40,11 @@ type JobRequest struct {
 	// IdempotencyKey makes a resubmission return the same ticket. Empty:
 	// one is generated (and reused by the SDK's own retries).
 	IdempotencyKey string
+	// MaxAttempts lowers the deployment's p3.max_retry for this job (0: the
+	// policy value). 1 = at most one automatic attempt: if it fails or its
+	// lease runs out the job stops (retries_exhausted) and an Approver
+	// decides -- for exactly-once / transactional work.
+	MaxAttempts int
 }
 
 // Ticket identifies a submitted job.
@@ -92,6 +97,12 @@ func (a *App) Submit(ctx context.Context, r JobRequest) (Ticket, error) {
 	}
 	body := map[string]any{"capability": r.Capability, "capability_version": r.Version, "origin_zone": r.OriginZone,
 		"payload_b64": r.Payload, "classification": r.Classification, "requirements": r.Requirements}
+	if r.MaxAttempts < 0 {
+		return Ticket{}, fmt.Errorf("heain-sdk: MaxAttempts must not be negative")
+	}
+	if r.MaxAttempts > 0 {
+		body["max_attempts"] = r.MaxAttempts
+	}
 	var t Ticket
 	var err error
 	for i := 0; ; i++ {

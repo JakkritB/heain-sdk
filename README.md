@@ -145,3 +145,9 @@ go build -o /tmp/heain-conformance ./conformance/cmd/heain-conformance
 
 - **`uses[]` patterns** (decided 2026-10-06 for orchestrators such as heain-job, which serve modules they cannot list in advance): `app` and each capability may contain `*`, e.g. `{app: "*", capabilities: ["*.split", "*.unit", "*.merge"]}`. `App.Call` and `App.Submit` match against them; the manifest check refuses anything but names and `*`. Conformance C12 uses the same matching.
 - **Conformance companions:** `conformance.yaml` may list `companions:` — directories of other apps the app under test needs (each with its own `conformance.yaml`). The suite builds, enrolls and starts them alongside the app (not under test), on the same node.
+
+## Step 4a-2: per-job retries and lease extension (2026-10-06)
+
+Uses two controls added to heain-core in Step 4a-2:
+- **`JobRequest.MaxAttempts`** (sent as `max_attempts`): lowers the deployment's `p3.max_retry` for one job; `1` = at most one automatic attempt — if it fails or its lease runs out, the job stops (`retries_exhausted`) and an Approver decides (P5). For exactly-once / transactional work. `0` (default) = the policy value; negative is refused before any call.
+- **The Worker extends leases:** while a handler runs, the Worker calls `POST /v1/app/jobs/{ticket}/extend` about every third of the lease, asking for the same length again (core caps it at `dispatch.lease_max`). The handler's ctx ends only when an extension is refused or core cannot be reached before the lease runs out. `ctx.Deadline()` is not moved by extensions. `Worker.FixedLease = true` turns this off.

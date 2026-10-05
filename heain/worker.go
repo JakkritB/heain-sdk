@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/heainframework/heain-sdk/core"
 	"github.com/heainframework/heain-sdk/manifest"
 )
 
@@ -28,7 +29,10 @@ type Job struct {
 // JobHandler runs one job and returns its output. Return Permanent(err)
 // for a failure that a retry cannot fix; any other error is retried by
 // core (up to p3.max_retry, then the job goes to an Approver). ctx carries
-// the job's trace and lane (for App.Reason) and ends when the lease does.
+// the job's trace and lane (for App.Reason) and ends when the lease does;
+// while the handler runs the Worker extends the lease (see Worker.FixedLease),
+// so ctx ends only if an extension is refused or core cannot be reached
+// before the lease runs out. ctx.Deadline() is not updated by extensions.
 type JobHandler func(ctx context.Context, job *Job) ([]byte, error)
 
 type permanentError struct{ err error }
@@ -49,6 +53,10 @@ type Worker struct {
 	Concurrency int
 	// Wait is the claim long-poll length (default 25 s, core caps it at 30 s).
 	Wait time.Duration
+	// FixedLease turns off lease extension: by default the Worker asks core
+	// (POST /v1/app/jobs/{t}/extend) to extend the lease about every third
+	// of its length while the handler runs, so long jobs keep their lease.
+	FixedLease bool
 }
 
 // NewWorker creates a worker for a.
@@ -152,7 +160,9 @@ func (w *Worker) run(ctx context.Context, j *Job) {
 	jctx = context.WithValue(jctx, keyRecords, sink)
 	if !j.LeaseExpiresAt.IsZero() {
 		var cancel context.CancelFunc
-		jctx, cancel = context.WithDeadline(jctx, j.LeaseExpiresAt)
+		jctx, cancel = context.WithCancel(jctx)
+		stop := w.keepLease(cancel, j)
+		defer stop()
 		defer cancel()
 	}
 	var output []byte
@@ -202,6 +212,68 @@ func (w *Worker) run(ctx context.Context, j *Job) {
 	if err != nil {
 		w.app.logf("heain-sdk: job %s: reporting %s to core failed: %v", j.TicketID, outcome, err)
 	}
+}
+
+// keepLease ends the job ctx (cancel) when the lease runs out and, unless
+// FixedLease, extends the lease every third of its length. stop ends it.
+func (w *Worker) keepLease(cancel context.CancelFunc, j *Job) (stop func()) {
+	expires := j.LeaseExpiresAt
+	length := time.Until(expires)
+	if length < time.Second {
+		length = time.Second
+	}
+	every := length / 3
+	secs := int((length + time.Second - 1) / time.Second)
+	path := "/v1/app/jobs/" + url.PathEscape(j.TicketID) + "/extend"
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		extend := !w.FixedLease
+		for {
+			wait := time.Until(expires)
+			if wait <= 0 {
+				w.app.logf("heain-sdk: job %s: lease ran out", j.TicketID)
+				cancel()
+				return
+			}
+			if extend && every < wait {
+				wait = every
+			}
+			select {
+			case <-done:
+				return
+			case <-time.After(wait):
+			}
+			if !extend || time.Now().After(expires) {
+				continue
+			}
+			ctx, c := context.WithTimeout(context.Background(), time.Until(expires))
+			var out struct {
+				LeaseExpiresAt time.Time `json:"lease_expires_at"`
+			}
+			_, err := w.app.Core.Do(ctx, http.MethodPost, path, nil, map[string]any{"lease_id": j.LeaseID, "seconds": secs}, &out)
+			c()
+			switch {
+			case err == nil && !out.LeaseExpiresAt.IsZero():
+				expires = out.LeaseExpiresAt
+			case refused(err):
+				// refused (lease_expired, not local, ...): stop asking; ctx
+				// ends when the current lease does.
+				w.app.logf("heain-sdk: job %s: lease extension refused: %v", j.TicketID, err)
+				extend = false
+			case err != nil:
+				w.app.logf("heain-sdk: job %s: lease extension failed (will retry): %v", j.TicketID, err)
+			}
+		}
+	}()
+	return func() { close(done); <-finished }
+}
+
+// refused reports a definite answer from core (4xx, not retryable).
+func refused(err error) bool {
+	var ce *core.Error
+	return errors.As(err, &ce) && ce.Status >= 400 && ce.Status < 500 && !ce.Retryable
 }
 
 func safeRun(ctx context.Context, h JobHandler, j *Job) (out []byte, err error) {
