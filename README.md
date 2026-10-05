@@ -46,3 +46,25 @@ the public sandbox.
 ## License
 
 Apache License 2.0 — see [LICENSE](./LICENSE).
+
+## heain-sdk v1 (rebuilt 2026-10-05, Step 3)
+
+The old `jobclient` and `coreclient` packages talked to heain-job directly over plain HTTP, without going through heain-core. They are removed; their last state is tagged `legacy-v0`. The `capacity` package (live RAM/GPU probe) stays.
+
+heain-sdk v1 is the universal library an app uses to connect to heain-core through the App API (spec `02-app-api.md`), over mTLS 1.3 with its own app certificate.
+
+| Package | What it does |
+|---|---|
+| `manifest` | Loads `heain-app.yaml` or `.json` (same schema), with unknown fields refused. Validates the spec 01 §4 rules, the same ones core applies, and checks `app.sdk`. |
+| `provision` | Obtains the app certificate through core's provisioning flow: token → CSR → probation → confirm. |
+| `core` | The App API client (TLS 1.3, the core's node id verified) and its error type. |
+| `heain` | `Start` loads and validates the manifest; **an invalid manifest never starts**. It then checks that the certificate CN is `<app-id>.<instance-id>`, checks the core's API version, registers and keeps the registration alive. `WaitActive` waits for an Approver to admit a new app or version, and `Close` deregisters. |
+| `examples/hello` | The smallest app; used by the live tests. |
+
+**Decided 2026-10-05:**
+- Manifests may be YAML or JSON.
+- `uses[]` is enforced by the SDK (slice 3b).
+- Reasoning records are signed over RFC 8785 (JCS) (slice 3b).
+- `factors` is required for `role: decision` (slice 3b).
+
+Live test: `bash scripts/live_3a.sh` runs against a real heain-core node and needs `~/heain-core`.
