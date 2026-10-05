@@ -504,6 +504,7 @@ var segRe = regexp.MustCompile(`\{[^}]+\}`)
 
 // endpointFor matches a concrete call to the manifest endpoint it serves.
 func (d *Driver) endpointFor(method, path string) (manifest.Endpoint, manifest.Capability, bool) {
+	path, _, _ = strings.Cut(path, "?") // a query string is not part of the endpoint's path
 	for _, e := range d.Man.Endpoints {
 		if !strings.EqualFold(e.Method, method) {
 			continue

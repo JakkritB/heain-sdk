@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -593,5 +596,44 @@ func TestDataKeysAndSealer(t *testing.T) {
 	}
 	if _, err := NewSealer([]byte("short")); err == nil {
 		t.Fatal("short key accepted")
+	}
+}
+
+func TestAuditChainHelpers(t *testing.T) {
+	f := &fake3{}
+	a, _, _ := startFake3(t, f)
+	prev := make([]byte, 32)
+	var recs []AuditRecord
+	for i := uint64(1); i <= 3; i++ {
+		ct := []byte(fmt.Sprintf("ciphertext-%d", i))
+		h := AuditChainHash(prev, i, ct)
+		recs = append(recs, AuditRecord{Seq: i, PrevHash: hex.EncodeToString(prev), Hash: hex.EncodeToString(h), Ciphertext: ct})
+		prev = h
+	}
+	last, err := VerifyAuditRecords("", recs)
+	if err != nil || last != hex.EncodeToString(prev) {
+		t.Fatalf("verify: %v", err)
+	}
+	if _, err := VerifyAuditRecords(recs[0].Hash, recs[1:]); err != nil {
+		t.Fatal("a segment verifies from its predecessor's hash")
+	}
+	recs[1].Ciphertext = []byte("altered")
+	if _, err := VerifyAuditRecords("", recs); !errors.Is(err, ErrAuditChain) {
+		t.Fatal("an altered record must fail")
+	}
+	if _, err := VerifyAuditRecords(recs[1].Hash, recs[0:1]); !errors.Is(err, ErrAuditChain) {
+		t.Fatal("a record that does not follow must fail")
+	}
+	d := sha256.Sum256([]byte("root"))
+	sig, err := a.SignDigest(d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyDigest(a.CertificatePEM(), d[:], sig); err != nil {
+		t.Fatalf("verify digest: %v", err)
+	}
+	d2 := sha256.Sum256([]byte("other"))
+	if VerifyDigest(a.CertificatePEM(), d2[:], sig) == nil {
+		t.Fatal("wrong digest verified")
 	}
 }
