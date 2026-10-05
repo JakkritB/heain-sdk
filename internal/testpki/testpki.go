@@ -65,6 +65,29 @@ func (p *PKI) Issue(t *testing.T, name, cn string) (certFile, keyFile string, pa
 	return
 }
 
+// IssueApp issues an app certificate as core's provisioning does: CN
+// <app-id>.<instance-id>, OU heain-sdk-client, client-auth only, no SANs.
+func (p *PKI) IssueApp(t *testing.T, name, cn string) (certFile, keyFile string, pair tls.Certificate) {
+	t.Helper()
+	p.serial++
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(p.serial), Subject: pkix.Name{CommonName: cn, OrganizationalUnit: []string{"heain-sdk-client"}},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, KeyUsage: x509.KeyUsageDigitalSignature}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, p.ca, &key.PublicKey, p.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kd, _ := x509.MarshalECPrivateKey(key)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kd})
+	certFile, keyFile = filepath.Join(p.Dir, name+".pem"), filepath.Join(p.Dir, name+".key")
+	_ = os.WriteFile(certFile, certPEM, 0o644)
+	_ = os.WriteFile(keyFile, keyPEM, 0o600)
+	pair, _ = tls.X509KeyPair(certPEM, keyPEM)
+	return
+}
+
 // Pool is the CA as a cert pool.
 func (p *PKI) Pool() *x509.CertPool {
 	pool := x509.NewCertPool()

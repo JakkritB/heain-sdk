@@ -68,3 +68,19 @@ heain-sdk v1 is the universal library an app uses to connect to heain-core throu
 - `factors` is required for `role: decision` (slice 3b).
 
 Live test: `bash scripts/live_3a.sh` runs against a real heain-core node and needs `~/heain-core`.
+
+## Step 3b: serving, calling, reasoning records (2026-10-05)
+
+| API (package `heain`) | What it does |
+|---|---|
+| `App.NewServer`, `Server.Handle` / `HandleFunc`, `Serve`, `ListenAndServe` | Serves the app's `execution: direct` endpoints over mTLS 1.3. Callers must present an app certificate (OU `heain-sdk-client`). Only endpoints declared in the manifest can be handled, and `Serve` refuses to start until every declared endpoint has a handler. |
+| (automatic) formal audit | Every call to a `formal: true` endpoint produces **exactly one** audit event in core (`app.event`): outcome `ok`, `error:<status>` or `refused:...`, with the caller, method, path, status and the ids of its reasoning records. Non-formal endpoints produce none. If core cannot record the event, the answer is withheld (`503 audit_unavailable`). |
+| (automatic) lanes | A capability with a `lane` requires `X-Heain-Lane` to match. A trace id seen in one lane of a `lanes.unlinkable` pair is refused in the other (`lane_violation`), and the refused id is not written into that lane's audit. |
+| `App.Reason(ctx, Decision)` | Writes an AI reasoning record (spec 04) to core: the input as SHA-256 only (raw input never leaves the app), model from the manifest, `factors` required for `role: decision`, signed over RFC 8785 (JCS) with the app key. `VerifyRecord` checks a signature. An `ai.used` capability whose record is required that answers without one is refused (`500 reasoning_record_missing`). |
+| `App.Discover`, `App.Call(ctx, CallSpec)` | Calls another app: only a dependency declared in `uses[]` (checked before any network call, `ErrNotDeclared`), resolved through core discovery (cached 10 s, round robin), over mTLS with the callee's certificate checked to be exactly `<app-id>.<instance-id>` of the discovered instance. The trace id is carried on, except into a different lane, where a fresh one is started. |
+| `TraceID`, `Lane`, `Caller`, `WithTrace` | The request's trace, lane and calling app instance. |
+| `examples/greeter`, `examples/greeter-caller` | A server with formal and non-formal endpoints, an AI capability and two unlinkable lanes, and an app that calls it. |
+
+Live test: `bash scripts/live_3b.sh` (needs `~/heain-core`).
+
+Known limit: the app-side server checks that the caller's certificate chains to the deployment CA and is an app certificate, but not core's revocation list; core's own endpoints do check it.

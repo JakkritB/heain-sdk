@@ -9,6 +9,8 @@ package heain
 
 import (
 	"context"
+	"crypto"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -46,12 +48,17 @@ type App struct {
 	Core     *core.Client
 	Instance string
 
-	mu     sync.Mutex
-	reg    core.Registration
-	stop   chan struct{}
-	done   chan struct{}
-	logf   func(string, ...any)
-	closed bool
+	mu      sync.Mutex
+	reg     core.Registration
+	opts    Options
+	pair    tls.Certificate
+	key     crypto.PrivateKey
+	disco   discoCache
+	clients sync.Map // app instance -> *http.Client (appClient)
+	stop    chan struct{}
+	done    chan struct{}
+	logf    func(string, ...any)
+	closed  bool
 }
 
 // ErrIdentity is returned when the certificate's CN is not <app-id>.<instance-id>.
@@ -103,11 +110,16 @@ func Start(ctx context.Context, o Options) (*App, error) {
 	if !served {
 		return nil, &manifest.ValidationError{Code: manifest.CodeAPIUnsupported, Reasons: []string{fmt.Sprintf("core %s serves %v, the manifest targets %s", info.CoreVersion, info.APIVersions, m.App.API)}}
 	}
+	pair, err := tls.LoadX509KeyPair(o.Core.CertFile, o.Core.KeyFile)
+	if err != nil {
+		return nil, err
+	}
 	reg, err := c.Register(ctx, m, o.InstanceID, o.EndpointBase)
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Manifest: m, Core: c, Instance: o.InstanceID, reg: reg, stop: make(chan struct{}), done: make(chan struct{}), logf: logf}
+	a := &App{Manifest: m, Core: c, Instance: o.InstanceID, reg: reg, stop: make(chan struct{}), done: make(chan struct{}), logf: logf,
+		opts: o, pair: pair, key: pair.PrivateKey}
 	logf("heain-sdk: %s registered with core %s (%s), status %s", want, info.NodeID, info.CoreVersion, reg.Status)
 	go a.heartbeat()
 	return a, nil
