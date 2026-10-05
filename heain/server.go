@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -153,6 +154,14 @@ func (s *Server) wrap(ep manifest.Endpoint, c manifest.Capability, h http.Handle
 			caller = r.TLS.PeerCertificates[0].Subject.CommonName
 			if !isAppCert(r.TLS.PeerCertificates[0]) {
 				writeErr(w, http.StatusForbidden, "identity_mismatch", "an app certificate is required")
+				return
+			}
+			if err := s.app.checkPeer(r.Context(), r.TLS.PeerCertificates[0]); err != nil {
+				if errors.Is(err, ErrRevoked) {
+					writeErr(w, http.StatusForbidden, "certificate_revoked", "the caller's app certificate is no longer valid")
+				} else {
+					writeErr(w, http.StatusServiceUnavailable, "revocation_unavailable", "the caller's certificate status could not be checked with core")
+				}
 				return
 			}
 		}

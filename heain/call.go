@@ -218,7 +218,7 @@ func (a *App) appClient(want string) (*http.Client, error) {
 			if !isAppCert(leaf) || leaf.Subject.CommonName != want {
 				return fmt.Errorf("peer is %q, expected app instance %q", leaf.Subject.CommonName, want)
 			}
-			return nil
+			return a.checkPeer(context.Background(), leaf)
 		}}
 	c, _ := a.clients.LoadOrStore(want, &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: tc}})
 	return c.(*http.Client), nil

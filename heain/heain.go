@@ -71,6 +71,7 @@ type App struct {
 	modeSubs []func(old, cur Mode)
 	modeDone chan struct{}
 	seqMu    sync.Mutex // journal app_seq counter
+	certs    certCache  // peer certificate status (revocation.go)
 }
 
 // ErrIdentity is returned when the certificate's CN is not <app-id>.<instance-id>.

@@ -3,6 +3,7 @@ package heain
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"net"
@@ -23,6 +24,7 @@ import (
 // answers discovery from a fixed table.
 type fake2 struct {
 	mu      sync.Mutex
+	revoked map[string]bool
 	events  []map[string]any
 	records []map[string]any
 	disco   map[string][]Instance
@@ -46,6 +48,9 @@ func (f *fake2) h(w http.ResponseWriter, r *http.Request) {
 		f.records = append(f.records, body)
 		w.WriteHeader(201)
 		_, _ = w.Write([]byte(`{"record_id":"` + body["record_id"].(string) + `"}`))
+	case strings.HasPrefix(r.URL.Path, "/v1/app/certs/"):
+		valid := !f.revoked[strings.TrimPrefix(r.URL.Path, "/v1/app/certs/")]
+		_ = json.NewEncoder(w).Encode(map[string]any{"valid": valid})
 	case r.URL.Path == "/v1/app/discover":
 		_ = json.NewEncoder(w).Encode(map[string]any{"instances": f.disco[r.URL.Query().Get("capability")]})
 	default:
@@ -265,5 +270,35 @@ func TestCanonical(t *testing.T) {
 	want := `{"A":true,"a":[0.000001,1e-7,10.5,"é\n"],"b":1e+21}`
 	if string(got) != want {
 		t.Fatalf("got %s\nwant %s", got, want)
+	}
+}
+
+func TestRevokedPeers(t *testing.T) {
+	e := startEnv(t)
+	RevocationTTL = 0
+	defer func() { RevocationTTL = 10 * time.Second }()
+	serialOf := func(a *App) string {
+		c, _ := x509.ParseCertificate(a.pair.Certificate[0])
+		return c.SerialNumber.String()
+	}
+	ctx := context.Background()
+	spec := CallSpec{App: "svc-app", Capability: "svc.greet", Method: "POST", Path: "/v1/greet"}
+	if _, err := e.caller.Call(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	e.f.mu.Lock()
+	e.f.revoked = map[string]bool{serialOf(e.caller): true}
+	e.f.mu.Unlock()
+	_, err := e.caller.Call(ctx, spec)
+	var ce *CallError
+	if !errors.As(err, &ce) || ce.Code != "certificate_revoked" {
+		t.Fatalf("a revoked caller must be refused by the server: %v", err)
+	}
+	e.f.mu.Lock()
+	e.f.revoked = map[string]bool{serialOf(e.svc): true}
+	e.f.mu.Unlock()
+	e.caller.clients = sync.Map{} // new connection, so the callee is checked again
+	if _, err := e.caller.Call(ctx, spec); err == nil || !strings.Contains(err.Error(), "certificate_revoked") {
+		t.Fatalf("a revoked callee must be refused by the caller: %v", err)
 	}
 }

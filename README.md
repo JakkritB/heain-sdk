@@ -101,3 +101,11 @@ Known limit: the app-side server checks that the caller's certificate chains to 
 Live test: `bash scripts/live_3c.sh` (needs `~/heain-core`, ~6 min).
 
 Known limit (core, by design): on a Worker node an app certificate is checked with the Master; cut off, the node falls back to its escrowed copy of the Master's state (`escrow.sync_interval`, default 10 s). An app enrolled less than that before a partition cannot work on the island.
+
+## Step 3d: peer certificate status (2026-10-05)
+
+- **Revocation:** the app-side server and `App.Call` now check the other app's certificate with core (`GET /v1/app/certs/{serial}`, core 1.3) besides the chain and the app OU. A revoked, expired or out-of-probation certificate is refused (`403 certificate_revoked` on the server; an error on the calling side). Answers are cached for `RevocationTTL` (10 s, as core caches the Master's answer). **Fail closed:** if core cannot answer, the call is refused (`503 revocation_unavailable`).
+- Needs heain-core with Step 3d (it reports `core_version` 1.3.0).
+- Core's P3 `/execute` (the legacy `/ingest` path) now hands jobs to apps through the App API, so an SDK `Worker` also runs those jobs, with no change in the app.
+
+Live test: `bash scripts/live_3d.sh` (needs `~/heain-core`).

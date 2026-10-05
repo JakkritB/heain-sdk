@@ -24,6 +24,7 @@ import (
 // fake3 is a fake core for jobs, P5, P7, mode and journal.
 type fake3 struct {
 	mu        sync.Mutex
+	revoked   map[string]bool
 	events    []map[string]any
 	submits   []string // idempotency keys seen
 	failFirst int32    // answer 503 to this many submits / journal writes
@@ -55,6 +56,9 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"core_version":"1.3.0","api_versions":["v1"],"node_id":"G"}`))
 	case p == "/v1/app/register":
 		_, _ = w.Write([]byte(`{"registration_id":"x","status":"active","heartbeat_interval_s":30}`))
+	case strings.HasPrefix(p, "/v1/app/certs/"):
+		valid := !f.revoked[strings.TrimPrefix(p, "/v1/app/certs/")]
+		_ = json.NewEncoder(w).Encode(map[string]any{"valid": valid})
 	case p == "/v1/app/mode":
 		_ = json.NewEncoder(w).Encode(f.mode)
 	case p == "/v1/app/audit/events":
