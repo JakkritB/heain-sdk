@@ -1,8 +1,8 @@
-// Package conformance is the heain conformance suite (spec 05): a host
-// command that builds and starts heain-core and the app under test in
-// Docker Compose, and a test driver that runs groups C1-C14 against them.
-// Every image is built FROM scratch from static binaries, so nothing is
-// pulled from a registry.
+// Package conformance is the heain conformance suite (spec 05): one
+// command builds heain-core, starts its nodes as processes on this machine,
+// starts the app under test with the app's own command -- any language, any
+// packaging (author decision 2026-10-06: Docker is not required) -- and
+// runs groups C1-C14 against them.
 package conformance
 
 import (
@@ -16,9 +16,19 @@ import (
 // Conf is conformance.yaml, shipped by the app next to its manifest
 // (author decision 2026-10-05): the inputs the suite cannot invent.
 type Conf struct {
-	Manifest string   `yaml:"manifest" json:"manifest"`
-	Prebuild []string `yaml:"prebuild,omitempty" json:"prebuild,omitempty"`
-	Port     int      `yaml:"port,omitempty" json:"port,omitempty"`
+	Manifest string `yaml:"manifest" json:"manifest"`
+	// Build runs once in the app directory before the tests (optional).
+	Build []string `yaml:"build,omitempty" json:"build,omitempty"`
+	// Start runs the app in the foreground, in the app directory, with the
+	// HEAIN_* variables of the container contract set (heain.StartFromEnv).
+	// Any command: a binary, an interpreter, or `docker run ...` if the
+	// developer packages the app that way.
+	Start []string `yaml:"start" json:"start"`
+	// Port the app serves its direct endpoints on (HEAIN_LISTEN).
+	Port int `yaml:"port,omitempty" json:"port,omitempty"`
+	// DataDirs the app persists to besides HEAIN_STATE_DIR (relative to
+	// the app directory), inspected by C14.
+	DataDirs []string `yaml:"data_dirs,omitempty" json:"data_dirs,omitempty"`
 	// Endpoints: one sample request per endpoint the suite should call.
 	Endpoints []Call `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
 	// Jobs: one sample job per execution: job capability.
@@ -76,6 +86,9 @@ func LoadConf(dir string) (Conf, error) {
 	}
 	if c.Port == 0 {
 		c.Port = 19443
+	}
+	if len(c.Start) == 0 {
+		return c, fmt.Errorf("conformance.yaml: start (the command that runs the app) is required")
 	}
 	return c, nil
 }

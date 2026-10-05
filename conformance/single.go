@@ -26,10 +26,20 @@ import (
 )
 
 // Phase 1 (single node G): C1-C9 and C11-C14.
+// Ports of the harness's core nodes (processes on this machine; the app
+// and the driver reach them over loopback, as an app on the node does).
 const (
-	gIP   = "10.77.0.10"
-	gNode = "G"
-	gBase = "https://127.0.0.1:18000" // the driver shares G's network namespace, like an app on the node
+	gNode     = "G"
+	gPort     = 28100
+	s1Port    = 28105
+	wPort     = 28103
+	proxyPort = 28110
+)
+
+var (
+	gBase  = fmt.Sprintf("https://127.0.0.1:%d", gPort)
+	gBase2 = gBase
+	wBase  = fmt.Sprintf("https://127.0.0.1:%d", wPort)
 )
 
 // callRec remembers one call to the app (for C5-C7).
@@ -52,7 +62,7 @@ type callRec struct {
 // RunSingle runs phase 1.
 func (d *Driver) RunSingle(ctx context.Context) {
 	defer d.Save()
-	d.appBase = fmt.Sprintf("https://%s:%d", gIP, d.Conf.Port)
+	d.appBase = fmt.Sprintf("https://127.0.0.1:%d", d.Conf.Port)
 	if !waitFor(90*time.Second, func() bool { st, _ := d.as("admin", gBase, gNode, "GET", "/health", nil); return st == 200 }) {
 		d.check("C3", "core G is up", false, "core did not answer /health within 90 s")
 		return
@@ -104,7 +114,7 @@ func (d *Driver) RunSingle(ctx context.Context) {
 	d.c12()
 	d.c11(ctx)
 	d.c13()
-	d.c14([]string{"/inspect/core", "/inspect/app"}, "phase 1")
+	d.c14(d.DataDirs, "phase 1")
 }
 
 func (d *Driver) probeManifest(withJobs bool) string {
@@ -131,7 +141,7 @@ func (d *Driver) c1(ctx context.Context) {
 		d.check("C1", "broken manifest prepared", false, "%v", err)
 	}
 	before := len(d.audit(gBase, gNode))
-	r := d.host("app_broken", map[string]string{"manifest": "/shared/app/broken-formal.yaml"})
+	r := d.host("app_broken", map[string]string{"manifest": broken})
 	after := d.audit(gBase, gNode)
 	reached := false
 	for _, e := range after[min(before, len(after)):] {
@@ -238,7 +248,7 @@ func firstLine(s string) string {
 
 func (d *Driver) c2() {
 	plain := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	st, _ := d.call(plain, "GET", "http://127.0.0.1:18000/v1/app/info", nil, nil)
+	st, _ := d.call(plain, "GET", strings.Replace(gBase, "https://", "http://", 1)+"/v1/app/info", nil, nil)
 	d.check("C2", "core: plain HTTP is refused", st == 0 || st >= 400, "status %d", st)
 	tls12 := func(cert, key string) *http.Client {
 		pair, _ := tls.LoadX509KeyPair(cert, key)
@@ -858,24 +868,12 @@ func (d *Driver) c13() {
 		r := d.host("remote_claim", nil)
 		d.check("C13", "a claim from another host is refused (locality_violation)", r.Exit == 0, "%s", firstLine(r.Out))
 	}
-	d.captureCheck("capture-g.json", "G's node")
+	d.skip("C13", "no plaintext in traffic leaving the node", "one node has no traffic between nodes; checked in the offline phase (the proxy between W and G inspects every byte)")
 }
 
-func (d *Driver) captureCheck(file, where string) {
-	time.Sleep(3 * time.Second)
-	raw, err := os.ReadFile(filepath.Join(d.Shared, file))
-	var c struct {
-		Frames  int            `json:"frames"`
-		Markers int            `json:"markers"`
-		Hits    map[string]int `json:"hits"`
-	}
-	_ = json.Unmarshal(raw, &c)
-	hits := 0
-	for _, n := range c.Hits {
-		hits += n
-	}
-	d.check("C13", "no plaintext marker in the network traffic leaving "+where, err == nil && c.Frames > 0 && c.Markers > 0 && hits == 0,
-		"%d frames captured, %d markers, %d hits", c.Frames, c.Markers, hits)
+func (d *Driver) proxyCheck() {
+	r := d.host("proxy_hits", nil)
+	d.check("C13", "no plaintext marker in any byte between W and G (all of it passes the harness proxy)", r.OK, "%s", r.Out)
 }
 
 // ---- C14 encryption at rest
@@ -900,7 +898,7 @@ func (d *Driver) c14(roots []string, label string) {
 			}
 			for _, m := range ms {
 				if bytesContains(raw, m) {
-					hits = append(hits, strings.TrimPrefix(p, "/inspect/")+": "+string(m))
+					hits = append(hits, p+": "+string(m))
 				}
 			}
 			return nil

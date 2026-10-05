@@ -1,7 +1,8 @@
 # Test inputs for heain-conformance (spec 05; author decision 2026-10-05).
 manifest: heain-app.yaml
-# run in this directory before `docker build` (CGO_ENABLED=0 is set)
-prebuild: [go, build, -o, refapp, .]
+# how to build and start the app -- any command; the suite sets the HEAIN_* variables
+build: [go, build, -o, refapp, .]
+start: [./refapp]
 port: 19443
 endpoints:
   - {method: POST, path: /v1/greet, body: {name: ann}, expect: 200}

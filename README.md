@@ -125,3 +125,18 @@ go build -o /tmp/heain-conformance ./conformance/cmd/heain-conformance
 - **Reference app `conformance/refapp`:** formal and non-formal endpoints, an AI endpoint and an AI job with signed records and a model hash, two unlinkable lanes, jobs, P5, P7, an app-to-app call through discovery, offline rules and its own journal events. It passes C1–C14.
 - **Found by C10 and fixed in the SDK:** an app learns the node's mode by polling (5 s), so right after a partition it could still serve a capability that is not allowed offline. The server now re-reads the mode from core first when its copy is older than `ModeFreshness` (1 s) — only for capabilities not allowed offline.
 - **Known gap reported by the suite:** C9 "data classes never leave their declared scope" is reported as *skip*: core does not filter discovery by zone yet.
+
+## Step 3e-3: the conformance suite without Docker (2026-10-06)
+
+**Author decision (2026-10-06):** Docker was only an example in the design. Developers build and package apps in their own way, so nothing in heain requires Docker — **this replaces the Docker Compose harness of 3e-2.**
+
+```
+go build -o /tmp/heain-conformance ./conformance/cmd/heain-conformance
+/tmp/heain-conformance run --app ./conformance/refapp --core ~/heain-core --out ./conformance-report
+```
+
+- The suite builds heain-core and runs its nodes as **processes on this machine** (ports 28100–28110). The app reaches its core over loopback, as on a real node.
+- The app is built and started with **its own commands** in `conformance.yaml`: `build` (optional) and `start` (required, foreground) — a binary, an interpreter, or `docker run ...` if the developer wants. The suite sets the `HEAIN_*` variables (`heain.StartFromEnv` reads them; apps in other languages will read them through heain-agent). Apps that persist outside `HEAIN_STATE_DIR` list those directories in `data_dirs` (C14).
+- The app is controlled with signals: SIGTERM (graceful leave), SIGSTOP/SIGCONT (missed heartbeats), and a second start with a broken manifest (C1).
+- **C13:** a claim through this machine's LAN address is refused (`locality_violation`); in the offline phase every byte between W and G passes the suite's proxy, which looks for the test data in clear. **C10:** the proxy is cut and healed by the suite.
+- No Dockerfile is needed; `conformance/refapp` has none.

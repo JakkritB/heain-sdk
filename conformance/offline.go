@@ -12,12 +12,7 @@ import (
 
 // Phase 2 (G <- S1, G <- W through a proxy; the app runs on W): C10, plus
 // C13 and C14 for the cross-node path.
-const (
-	wIP    = "10.77.0.12"
-	wNode  = "W"
-	wBase  = "https://127.0.0.1:18000" // the driver shares W's network namespace
-	gBase2 = "https://10.77.0.10:18000"
-)
+const wNode = "W"
 
 func (d *Driver) mode(base, node string) string {
 	_, out := d.as("admin", base, node, "GET", "/health", nil)
@@ -60,7 +55,7 @@ func (d *Driver) offlineAllowed(capName string) bool {
 // RunOffline runs phase 2 (C10).
 func (d *Driver) RunOffline(ctx context.Context) {
 	defer d.Save()
-	d.appBase = fmt.Sprintf("https://%s:%d", wIP, d.Conf.Port)
+	d.appBase = fmt.Sprintf("https://127.0.0.1:%d", d.Conf.Port)
 	for _, nb := range [][2]string{{gBase2, gNode}, {wBase, wNode}} {
 		if !waitFor(120*time.Second, func() bool { st, _ := d.as("admin", nb[0], nb[1], "GET", "/health", nil); return st == 200 }) {
 			d.check("C10", "core "+nb[1]+" is up", false, "no /health within 120 s")
@@ -112,7 +107,7 @@ func (d *Driver) RunOffline(ctx context.Context) {
 	time.Sleep(15 * time.Second) // W's escrowed copy of G's state must include the new certificates
 
 	// ---- partition
-	_ = writeShared(filepath.Join(d.Shared, "proxy.state"), []byte("cut"), 0o644)
+	d.host("proxy_cut", nil)
 	stand := waitFor(90*time.Second, func() bool { return d.mode(wBase, wNode) == "standalone" })
 	d.check("C10", "partition (W's only path to G cut) -> W is standalone", stand, "")
 	if !stand {
@@ -184,7 +179,7 @@ func (d *Driver) RunOffline(ctx context.Context) {
 	d.check("C10", "the journal is written while standalone (the app's formal events)", appEv > 0, "%d entries, %d app.event of the app, %d app domain events", len(j.Entries), appEv, appSrc)
 
 	// ---- heal
-	_ = writeShared(filepath.Join(d.Shared, "proxy.state"), []byte("up"), 0o644)
+	d.host("proxy_heal", nil)
 	normal := waitFor(180*time.Second, func() bool { return d.mode(wBase, wNode) == "normal" })
 	d.check("C10", "reconnect -> W leaves standalone", normal, "")
 	_, out = d.probeDo(wBase, wNode, "GET", "/v1/app/mode", nil)
@@ -219,6 +214,6 @@ func (d *Driver) RunOffline(ctx context.Context) {
 	}
 	d.check("C10", "reconcile: no lost and no duplicated events (by sequence number)", last > 0 && lost == 0 && dup == 0, "%d entries on W, %d lost, %d duplicated", last, lost, dup)
 	d.check("C10", "the app's own journal events reached G", appMerged == appSrc, "%d on W, %d merged on G", appSrc, appMerged)
-	d.captureCheck("capture-w.json", "W's node")
-	d.c14([]string{"/inspect/g", "/inspect/w", "/inspect/app"}, "phase 2: G, W and the app")
+	d.proxyCheck()
+	d.c14(d.DataDirs, "phase 2: G, W and the app")
 }

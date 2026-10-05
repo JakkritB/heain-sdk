@@ -74,7 +74,7 @@ func (g *Group) add(c Check) {
 	switch {
 	case !c.OK && !c.Skipped:
 		g.Status = "fail"
-	case c.OK && g.Status == "n/a":
+	case c.OK && !c.Skipped && g.Status == "n/a":
 		g.Status = "pass"
 	}
 }
@@ -138,8 +138,14 @@ type Driver struct {
 	ProbeCert  string
 	ProbeKey   string
 	probeCore  map[string]*core.Client
-	appBase    string // https://<node ip>:<port>
+	appBase    string // https://127.0.0.1:<port>
 	traceLanes map[string]map[string]bool
+
+	// Host does what the driver cannot: start, stop, pause the app, restart
+	// core, the proxy between W and G (set by the runner).
+	Host func(action string, args map[string]string) HostResult
+	// DataDirs are the directories core and the app persist to (C14).
+	DataDirs []string
 }
 
 // NewDriver loads the shared state written by the host.
@@ -304,7 +310,7 @@ func waitFor(timeout time.Duration, f func() bool) bool {
 	}
 }
 
-// ---- host actions (docker steps the driver cannot do itself) ----
+// ---- host actions (process steps the runner does) ----
 
 // HostResult is the host's answer to an action.
 type HostResult struct {
@@ -314,19 +320,11 @@ type HostResult struct {
 }
 
 func (d *Driver) host(action string, args map[string]string) HostResult {
-	d.ctlN++
-	base := filepath.Join(d.Shared, "ctl", fmt.Sprintf("%03d", d.ctlN))
-	_ = writeJSONFile(base+".req", map[string]any{"action": action, "args": args})
 	log.Printf("driver: host action %s %v", action, args)
-	for i := 0; i < 600; i++ {
-		if raw, err := os.ReadFile(base + ".res"); err == nil {
-			var r HostResult
-			_ = json.Unmarshal(raw, &r)
-			return r
-		}
-		time.Sleep(500 * time.Millisecond)
+	if d.Host == nil {
+		return HostResult{Out: "no host"}
 	}
-	return HostResult{Out: "host did not answer"}
+	return d.Host(action, args)
 }
 
 // ---- core helpers ----
@@ -526,7 +524,7 @@ func aiUsed(c manifest.Capability) bool {
 
 // RemoteClaim tries a job claim with the probe's certificate from another
 // host (C13); core must refuse it.
-func RemoteClaim(shared, coreURL string) (int, string, error) {
+func RemoteClaim(shared, coreURL string) (int, string, error) { // coreURL: core through this machine's LAN address
 	pool, err := core.LoadPool(filepath.Join(shared, "certs", "ca.pem"))
 	if err != nil {
 		return 0, "", err

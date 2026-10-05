@@ -1,48 +1,59 @@
 package conformance
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // RunOptions configure `heain-conformance run`.
 type RunOptions struct {
-	AppDir  string   // the app under test (Dockerfile, conformance.yaml, manifest)
-	CoreDir string   // heain-core source (built with CGO_ENABLED=0)
-	SDKDir  string   // heain-sdk source (for the harness tool binary)
-	OutDir  string   // where report.json / report.txt / logs are copied
+	AppDir  string   // the app under test (conformance.yaml, manifest, its own build/start commands)
+	CoreDir string   // heain-core source
+	OutDir  string   // where report.json, report.txt and the logs are copied
 	Phases  []string // single, offline
-	Keep    bool     // leave containers and the work directory
+	Keep    bool     // keep the work directory
 	Log     io.Writer
 }
 
 type runner struct {
-	o       RunOptions
-	conf    Conf
-	work    string
-	shared  string
-	tag     string
-	project string
-	file    string
-	env     []string
+	o      RunOptions
+	conf   Conf
+	work   string
+	shared string
+	node   string // the core binary
+	lanIP  string
+	phase  string
+	cores  map[string]*proc
+	coreA  map[string][]string
+	app    *proc
+	proxy  *scanProxy
+	logs   string
 }
 
-// Run builds everything, runs the phases and returns the report.
+type proc struct {
+	name string
+	cmd  *exec.Cmd
+	done chan struct{}
+	out  *bytes.Buffer
+	mu   sync.Mutex
+}
+
+// Run builds heain-core and the app, runs the phases and returns the report.
 func Run(ctx context.Context, o RunOptions) (*Report, error) {
-	r := &runner{o: o, tag: strconv.FormatInt(time.Now().Unix(), 36)}
-	r.env = r.common()
+	r := &runner{o: o}
 	var err error
 	if r.conf, err = LoadConf(o.AppDir); err != nil {
 		return nil, err
@@ -50,18 +61,19 @@ func Run(ctx context.Context, o RunOptions) (*Report, error) {
 	if r.work, err = os.MkdirTemp("", "heain-conformance-"); err != nil {
 		return nil, err
 	}
-	r.shared = filepath.Join(r.work, "shared")
-	for _, d := range []string{"build/core", "build/tool", "shared/app", "shared/ctl", "shared/enroll", "shared/logs"} {
-		if err := os.MkdirAll(filepath.Join(r.work, d), 0o755); err != nil {
+	r.shared, r.logs = filepath.Join(r.work, "shared"), filepath.Join(r.work, "logs")
+	for _, d := range []string{r.shared + "/app", r.logs} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	r.lanIP = lanAddress()
 	r.logf("work directory %s", r.work)
 	if err := r.build(ctx); err != nil {
 		return nil, err
 	}
 	for _, ph := range o.Phases {
-		if err := r.phase(ctx, ph); err != nil {
+		if err := r.runPhase(ctx, strings.TrimSpace(ph)); err != nil {
 			r.logf("phase %s: %v", ph, err)
 		}
 	}
@@ -78,64 +90,46 @@ func Run(ctx context.Context, o RunOptions) (*Report, error) {
 		for _, f := range []string{"report.json", "report.txt"} {
 			copyFile(filepath.Join(r.shared, f), filepath.Join(o.OutDir, f))
 		}
-		logs, _ := filepath.Glob(filepath.Join(r.shared, "logs", "*"))
+		logs, _ := filepath.Glob(filepath.Join(r.logs, "*"))
 		for _, l := range logs {
 			copyFile(l, filepath.Join(o.OutDir, "logs", filepath.Base(l)))
 		}
 	}
 	if !o.Keep {
 		_ = os.RemoveAll(r.work)
-		for _, n := range []string{"core", "tool", "app"} {
-			_, _ = r.sh(context.Background(), "", nil, "docker", "image", "rm", "-f", r.image(n))
-		}
 	}
 	return rep, nil
 }
 
 func (r *runner) logf(f string, a ...any) { fmt.Fprintf(r.o.Log, "heain-conformance: "+f+"\n", a...) }
 
-func (r *runner) sh(ctx context.Context, dir string, env []string, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+func (r *runner) sh(ctx context.Context, dir string, env []string, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-// build: static binaries, FROM scratch images, the app image.
 func (r *runner) build(ctx context.Context) error {
-	static := []string{"CGO_ENABLED=0", "GOOS=linux"}
-	coreEnv := append(append([]string{}, static...), "GOWORK=off")
+	r.node = filepath.Join(r.work, "node")
+	coreEnv := []string{"GOWORK=off"}
 	if v := os.Getenv("CORE_GOFLAGS"); v != "" {
 		coreEnv = append(coreEnv, "GOFLAGS="+v)
 	}
-	if v := os.Getenv("SDK_GOWORK"); v != "" { // like the live tests: a workspace for the SDK build
-		static = append(static, "GOWORK="+v, "GOFLAGS=")
-	}
 	r.logf("building heain-core from %s", r.o.CoreDir)
-	if out, err := r.sh(ctx, r.o.CoreDir, coreEnv, "go", "build", "-o", filepath.Join(r.work, "build/core/node"), "./cmd/node"); err != nil {
+	if out, err := r.sh(ctx, r.o.CoreDir, coreEnv, []string{"go", "build", "-o", r.node, "./cmd/node"}); err != nil {
 		return fmt.Errorf("core build: %v\n%s", err, out)
 	}
-	r.logf("building the harness tool from %s", r.o.SDKDir)
-	if out, err := r.sh(ctx, r.o.SDKDir, static, "go", "build", "-o", filepath.Join(r.work, "build/tool/hc"), "./conformance/cmd/heain-conformance"); err != nil {
-		return fmt.Errorf("tool build: %v\n%s", err, out)
-	}
-	_ = os.WriteFile(filepath.Join(r.work, "build/core/Dockerfile"), []byte("FROM scratch\nCOPY node /node\nENTRYPOINT [\"/node\"]\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(r.work, "build/tool/Dockerfile"), []byte("FROM scratch\nCOPY hc /hc\nENTRYPOINT [\"/hc\"]\n"), 0o644)
-	for name, dir := range map[string]string{"core": "build/core", "tool": "build/tool"} {
-		if out, err := r.sh(ctx, r.work, nil, "docker", "build", "-q", "-t", "heain-conf-"+name+":"+r.tag, dir); err != nil {
-			return fmt.Errorf("docker build %s: %v\n%s", name, err, out)
+	if len(r.conf.Build) > 0 {
+		var env []string
+		if v := os.Getenv("SDK_GOWORK"); v != "" { // like the live tests: a Go workspace for SDK-based apps
+			env = append(env, "GOWORK="+v, "GOFLAGS=")
 		}
-	}
-	if len(r.conf.Prebuild) > 0 {
-		r.logf("app prebuild: %s", strings.Join(r.conf.Prebuild, " "))
-		if out, err := r.sh(ctx, r.o.AppDir, static, r.conf.Prebuild[0], r.conf.Prebuild[1:]...); err != nil {
-			return fmt.Errorf("app prebuild: %v\n%s", err, out)
+		r.logf("building the app: %s", strings.Join(r.conf.Build, " "))
+		if out, err := r.sh(ctx, r.o.AppDir, env, r.conf.Build); err != nil {
+			return fmt.Errorf("app build: %v\n%s", err, out)
 		}
-	}
-	r.logf("building the app image from %s", r.o.AppDir)
-	if out, err := r.sh(ctx, r.o.AppDir, nil, "docker", "build", "-q", "-t", "heain-conf-app:"+r.tag, "."); err != nil {
-		return fmt.Errorf("app docker build: %v\n%s", err, out)
 	}
 	copyFile(filepath.Join(r.o.AppDir, r.conf.Manifest), filepath.Join(r.shared, "app", "heain-app.yaml"))
 	raw, _ := json.Marshal(r.conf)
@@ -149,213 +143,446 @@ func copyFile(from, to string) {
 	}
 }
 
-// ---- compose ----
-
-type svc = map[string]any
-
-func (r *runner) image(n string) string { return "heain-conf-" + n + ":" + r.tag }
-
-func (r *runner) common() []string {
-	return []string{fmt.Sprintf("HOST_UID=%d", os.Getuid()), fmt.Sprintf("HOST_GID=%d", os.Getgid())}
+// lanAddress is this machine's first non-loopback IPv4 address (C13: a
+// claim sent to core through it does not come from loopback).
+func lanAddress() string {
+	ifs, _ := net.Interfaces()
+	for _, i := range ifs {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLoopback() {
+				return n.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
-func netns(ip string) svc {
-	return svc{"command": []string{"hold"}, "networks": svc{"hc": svc{"ipv4_address": ip}}}
+// ---- processes ----
+
+func (r *runner) spawn(name, dir string, env []string, args []string) (*proc, error) {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	lf, err := os.OpenFile(filepath.Join(r.logs, r.phase+"-"+name+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	p := &proc{name: name, cmd: cmd, done: make(chan struct{}), out: &bytes.Buffer{}}
+	w := io.MultiWriter(lf, &lockedWriter{p: p})
+	cmd.Stdout, cmd.Stderr = w, w
+	if err := cmd.Start(); err != nil {
+		lf.Close()
+		return nil, fmt.Errorf("start %s: %w", name, err)
+	}
+	go func() { _ = cmd.Wait(); lf.Close(); close(p.done) }()
+	return p, nil
 }
 
-func coreArgs(id, tier, ip string, extra ...string) []string {
-	a := []string{"-node-id=" + id, "-tier=" + tier, "-raft-addr=" + ip + ":19000", "-data-dir=/data", "-http-addr=0.0.0.0:18000",
-		"-cert=/shared/certs/" + id + ".pem", "-key=/shared/certs/" + id + ".key", "-ca=/shared/certs/ca.pem",
+type lockedWriter struct{ p *proc }
+
+func (l *lockedWriter) Write(b []byte) (int, error) {
+	l.p.mu.Lock()
+	defer l.p.mu.Unlock()
+	if l.p.out.Len() < 1<<20 {
+		l.p.out.Write(b)
+	}
+	return len(b), nil
+}
+
+func (p *proc) signal(s syscall.Signal) {
+	if p != nil && p.cmd.Process != nil {
+		_ = syscall.Kill(-p.cmd.Process.Pid, s)
+	}
+}
+
+func (p *proc) running() bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// stop sends SIGTERM to the process group, then SIGKILL after grace.
+func (p *proc) stop(grace time.Duration) {
+	if !p.running() {
+		return
+	}
+	p.signal(syscall.SIGCONT)
+	p.signal(syscall.SIGTERM)
+	select {
+	case <-p.done:
+	case <-time.After(grace):
+		p.signal(syscall.SIGKILL)
+		<-p.done
+	}
+}
+
+func (p *proc) exitCode() int {
+	if p.cmd.ProcessState == nil {
+		return -1
+	}
+	return p.cmd.ProcessState.ExitCode()
+}
+
+// ---- phases ----
+
+func (r *runner) dir(parts ...string) string {
+	d := filepath.Join(append([]string{r.work, r.phase}, parts...)...)
+	_ = os.MkdirAll(d, 0o700)
+	return d
+}
+
+func (r *runner) coreArgs(id, tier string, port, raft int, extra ...string) []string {
+	d, c := r.dir(id), filepath.Join(r.shared, "certs")
+	a := []string{r.node, "-node-id=" + id, "-tier=" + tier, "-raft-addr=127.0.0.1:" + strconv.Itoa(raft), "-data-dir=" + d,
+		"-http-addr=127.0.0.1:" + strconv.Itoa(port), "-cert=" + c + "/" + id + ".pem", "-key=" + c + "/" + id + ".key", "-ca=" + c + "/ca.pem",
 		"-admin-node-id=admin", "-approver-ids=approver-1",
-		"-ingest-queue-path=/data/queue.db", "-staging-path=/data/staging.db", "-approval-store-path=/data/approvals.db"}
+		"-ingest-queue-path=" + d + "/queue.db", "-staging-path=" + d + "/staging.db", "-approval-store-path=" + d + "/approvals.db"}
 	return append(a, extra...)
 }
 
-func (r *runner) compose(phase string) map[string]any {
-	shared := r.shared + ":/shared"
-	tool := func(s svc) svc {
-		s["image"] = r.image("tool")
-		s["environment"] = r.common()
-		if _, ok := s["volumes"]; !ok {
-			s["volumes"] = []string{shared}
-		}
-		return s
+func (r *runner) worker(id string, port, raft, promote int, parent string) []string {
+	return r.coreArgs(id, "WORKER", port, raft, "-bootstrap=false", "-parent-addr="+parent+"/health", "-parent-node-id=G",
+		"-promote-raft-addr=127.0.0.1:"+strconv.Itoa(promote), "-promote-data-dir="+r.dir(id, "promote"),
+		"-farm-register-addr="+parent, "-farm-register-node-id=G", "-self-addr=https://127.0.0.1:"+strconv.Itoa(port), "-farm-register-interval=2s")
+}
+
+func (r *runner) startCore(id string, args []string) error {
+	p, err := r.spawn(id, r.work, nil, args)
+	if err != nil {
+		return err
 	}
-	coreSvc := func(id, ns string, args []string, vol string) svc {
-		return svc{"image": r.image("core"), "network_mode": "service:" + ns, "command": args, "tmpfs": []string{"/tmp"},
-			"volumes":    []string{vol + ":/data", r.shared + ":/shared:ro"},
-			"depends_on": svc{"pki": svc{"condition": "service_completed_successfully"}, ns: svc{"condition": "service_started"}}}
-	}
+	r.cores[id], r.coreA[id] = p, args
+	return nil
+}
+
+func (r *runner) appEnv(coreID string, corePort int, enrollPort int) []string {
+	c := filepath.Join(r.shared, "certs")
 	port := strconv.Itoa(r.conf.Port)
-	appEnv := func(nodeIP, coreID, enrollURL, enrollID string) []string {
-		return []string{"HEAIN_MANIFEST=/shared/app/heain-app.yaml", "HEAIN_INSTANCE=a1", "HEAIN_CORE_URL=https://127.0.0.1:18000", "HEAIN_CORE_ID=" + coreID,
-			"HEAIN_CA=/shared/certs/ca.pem", "HEAIN_CHAIN=/shared/certs/prov.pem", "HEAIN_STATE_DIR=/state", "HEAIN_ENROLL_TOKEN=/shared/enroll/a1.json",
-			"HEAIN_ENROLL_CORE_URL=" + enrollURL, "HEAIN_ENROLL_CORE_ID=" + enrollID,
-			"HEAIN_ENDPOINT_BASE=https://" + nodeIP + ":" + port, "HEAIN_LISTEN=0.0.0.0:" + port}
+	return []string{"HEAIN_MANIFEST=" + filepath.Join(r.shared, "app", "heain-app.yaml"), "HEAIN_INSTANCE=a1",
+		"HEAIN_CORE_URL=https://127.0.0.1:" + strconv.Itoa(corePort), "HEAIN_CORE_ID=" + coreID,
+		"HEAIN_CA=" + c + "/ca.pem", "HEAIN_CHAIN=" + c + "/prov.pem", "HEAIN_STATE_DIR=" + r.dir("app-state"),
+		"HEAIN_ENROLL_TOKEN=" + filepath.Join(r.shared, "enroll", "a1.json"),
+		"HEAIN_ENROLL_CORE_URL=https://127.0.0.1:" + strconv.Itoa(enrollPort), "HEAIN_ENROLL_CORE_ID=G",
+		"HEAIN_ENDPOINT_BASE=https://127.0.0.1:" + port, "HEAIN_LISTEN=127.0.0.1:" + port}
+}
+
+func (r *runner) runPhase(ctx context.Context, phase string) error {
+	r.phase, r.cores, r.coreA, r.app, r.proxy = phase, map[string]*proc{}, map[string][]string{}, nil, nil
+	for _, d := range []string{"certs", "enroll", "probe-p1", "probe-p2"} {
+		_ = os.RemoveAll(filepath.Join(r.shared, d))
 	}
-	services := svc{}
-	vols := svc{"app-state": svc{}}
+	_ = os.MkdirAll(filepath.Join(r.shared, "enroll"), 0o755)
+	_ = os.Remove(filepath.Join(r.shared, "markers.txt"))
+	r.logf("phase %s: starting", phase)
+	defer func() {
+		r.app.stop(30 * time.Second)
+		for _, p := range r.cores {
+			p.stop(15 * time.Second)
+		}
+		if r.proxy != nil {
+			r.proxy.close()
+		}
+	}()
+	var appEnv []string
+	var dataDirs []string
 	switch phase {
 	case "single":
-		services["pki"] = tool(svc{"command": []string{"pki", "-out", "/shared", "-nodes", "G=" + gIP}, "network_mode": "none"})
-		services["netns-g"] = tool(netns(gIP))
-		services["g"] = coreSvc("G", "netns-g", coreArgs("G", "GLOBAL_PRIMARY", gIP, "-bootstrap=true",
-			"-broadcast-topology-file=/shared/topology.json", "-broadcast-global-addr=https://"+gIP+":18000", "-broadcast-global-node-id=G",
-			"-provision-ca-cert=/shared/certs/prov.pem", "-provision-ca-key=/shared/certs/prov.key", "${G_EXTRA:--compat-test-probe=false}"), "g-data")
-		services["capture"] = tool(svc{"command": []string{"capture", "-iface", "eth0", "-markers", "/shared/markers.txt", "-out", "/shared/capture-g.json"},
-			"network_mode": "service:netns-g", "cap_add": []string{"NET_RAW"}, "depends_on": []string{"netns-g"}})
-		services["app"] = svc{"image": r.image("app"), "network_mode": "service:netns-g", "environment": appEnv(gIP, "G", "https://127.0.0.1:18000", "G"),
-			"volumes": []string{"app-state:/state", r.shared + ":/shared:ro"}, "tmpfs": []string{"/tmp"}, "profiles": []string{"app"}, "stop_grace_period": "30s"}
-		services["driver"] = tool(svc{"command": []string{"driver", "-phase", "single", "-shared", "/shared"}, "network_mode": "service:netns-g",
-			"volumes": []string{shared, "g-data:/inspect/core:ro", "app-state:/inspect/app:ro"}, "profiles": []string{"driver"}})
-		services["remote"] = tool(svc{"command": []string{"remote-claim", "-shared", "/shared", "-core", "https://" + gIP + ":18000"},
-			"networks": svc{"hc": svc{"ipv4_address": "10.77.0.30"}}, "profiles": []string{"remote"}})
-		vols["g-data"] = svc{}
-	case "offline":
-		services["pki"] = tool(svc{"command": []string{"pki", "-out", "/shared", "-nodes", "G=" + gIP + ",S1=10.77.0.11,W=" + wIP}, "network_mode": "none"})
-		services["netns-g"] = tool(netns(gIP))
-		services["netns-s1"] = tool(netns("10.77.0.11"))
-		services["netns-w"] = tool(netns(wIP))
-		services["g"] = coreSvc("G", "netns-g", coreArgs("G", "ZONE", gIP, "-bootstrap=true", "-farm-registry-ttl=30s",
-			"-provision-ca-cert=/shared/certs/prov.pem", "-provision-ca-key=/shared/certs/prov.key"), "g-data")
-		worker := func(id, ip, parent string) []string {
-			return coreArgs(id, "WORKER", ip, "-bootstrap=false", "-parent-addr="+parent+"/health", "-parent-node-id=G",
-				"-promote-raft-addr="+ip+":19001", "-promote-data-dir=/data/promote", "-farm-register-addr="+parent, "-farm-register-node-id=G",
-				"-self-addr=https://"+ip+":18000", "-farm-register-interval=2s")
-		}
-		services["s1"] = coreSvc("S1", "netns-s1", worker("S1", "10.77.0.11", "https://"+gIP+":18000"), "s1-data")
-		services["proxy"] = tool(svc{"command": []string{"proxy", "-listen", "0.0.0.0:28000", "-to", gIP + ":18000", "-state", "/shared/proxy.state"},
-			"networks": svc{"hc": svc{"ipv4_address": "10.77.0.13"}}})
-		services["w"] = coreSvc("W", "netns-w", worker("W", wIP, "https://10.77.0.13:28000"), "w-data")
-		services["capture"] = tool(svc{"command": []string{"capture", "-iface", "eth0", "-markers", "/shared/markers.txt", "-out", "/shared/capture-w.json"},
-			"network_mode": "service:netns-w", "cap_add": []string{"NET_RAW"}, "depends_on": []string{"netns-w"}})
-		services["app"] = svc{"image": r.image("app"), "network_mode": "service:netns-w", "environment": appEnv(wIP, "W", "https://"+gIP+":18000", "G"),
-			"volumes": []string{"app-state:/state", r.shared + ":/shared:ro"}, "tmpfs": []string{"/tmp"}, "profiles": []string{"app"}, "stop_grace_period": "30s"}
-		services["driver"] = tool(svc{"command": []string{"driver", "-phase", "offline", "-shared", "/shared"}, "network_mode": "service:netns-w",
-			"volumes": []string{shared, "g-data:/inspect/g:ro", "w-data:/inspect/w:ro", "app-state:/inspect/app:ro"}, "profiles": []string{"driver"}})
-		vols["g-data"], vols["s1-data"], vols["w-data"] = svc{}, svc{}, svc{}
-	}
-	return map[string]any{"name": r.project, "services": services, "volumes": vols,
-		"networks": svc{"hc": svc{"ipam": svc{"config": []svc{{"subnet": "10.77.0.0/24"}}}}}}
-}
-
-func (r *runner) dc(ctx context.Context, env []string, args ...string) (string, error) {
-	a := append([]string{"compose", "-p", r.project, "-f", r.file}, args...)
-	return r.sh(ctx, r.work, append(r.env, env...), "docker", a...)
-}
-
-// phase runs one compose project with its driver, answering its host actions.
-func (r *runner) phase(ctx context.Context, phase string) error {
-	r.project = "heain-conf-" + phase + "-" + r.tag
-	r.file = filepath.Join(r.work, phase+".compose.yaml")
-	raw, _ := yaml.Marshal(r.compose(phase))
-	if err := os.WriteFile(r.file, raw, 0o644); err != nil {
-		return err
-	}
-	_ = os.WriteFile(filepath.Join(r.shared, "proxy.state"), []byte("up"), 0o644)
-	ctls, _ := filepath.Glob(filepath.Join(r.shared, "ctl", "*"))
-	for _, f := range ctls {
-		_ = os.Remove(f)
-	}
-	_ = os.RemoveAll(filepath.Join(r.shared, "enroll"))
-	_ = os.MkdirAll(filepath.Join(r.shared, "enroll"), 0o755)
-	_ = os.RemoveAll(filepath.Join(r.shared, "certs"))
-	probes, _ := filepath.Glob(filepath.Join(r.shared, "probe-*"))
-	for _, p := range probes {
-		_ = os.RemoveAll(p)
-	}
-	r.logf("phase %s: starting (%s)", phase, r.project)
-	defer func() {
-		for _, s := range []string{"g", "s1", "w", "app", "proxy"} {
-			if out, err := r.dc(context.Background(), nil, "logs", "--no-color", s); err == nil && strings.TrimSpace(out) != "" {
-				_ = os.WriteFile(filepath.Join(r.shared, "logs", phase+"-"+s+".log"), []byte(out), 0o644)
-			}
-		}
-		if !r.o.Keep {
-			_, _ = r.dc(context.Background(), nil, "--profile", "app", "--profile", "driver", "--profile", "remote", "down", "-v", "--remove-orphans", "-t", "5")
-		}
-	}()
-	if out, err := r.dc(ctx, nil, "up", "-d"); err != nil {
-		return fmt.Errorf("compose up: %v\n%s", err, out)
-	}
-	driver := exec.CommandContext(ctx, "docker", "compose", "-p", r.project, "-f", r.file, "run", "--rm", "--no-deps", "driver")
-	driver.Dir, driver.Env = r.work, append(os.Environ(), r.env...)
-	pr, pw := io.Pipe()
-	driver.Stdout, driver.Stderr = pw, pw
-	go func() {
-		sc := bufio.NewScanner(pr)
-		for sc.Scan() {
-			fmt.Fprintf(r.o.Log, "  [%s] %s\n", phase, sc.Text())
-		}
-	}()
-	if err := driver.Start(); err != nil {
-		return err
-	}
-	done := make(chan error, 1)
-	go func() { done <- driver.Wait(); pw.Close() }()
-	served := map[string]bool{}
-	for {
-		select {
-		case err := <-done:
-			r.serveActions(ctx, served) // late requests
+		if err := PKI(r.shared, map[string]string{"G": r.lanOr()}); err != nil {
 			return err
-		case <-time.After(300 * time.Millisecond):
-			r.serveActions(ctx, served)
 		}
-	}
-}
-
-func (r *runner) serveActions(ctx context.Context, served map[string]bool) {
-	reqs, _ := filepath.Glob(filepath.Join(r.shared, "ctl", "*.req"))
-	sort.Strings(reqs)
-	for _, f := range reqs {
-		if served[f] {
-			continue
-		}
-		served[f] = true
-		var q struct {
-			Action string            `json:"action"`
-			Args   map[string]string `json:"args"`
-		}
-		raw, _ := os.ReadFile(f)
-		_ = json.Unmarshal(raw, &q)
-		res := r.action(ctx, q.Action, q.Args)
-		out, _ := json.Marshal(res)
-		_ = os.WriteFile(strings.TrimSuffix(f, ".req")+".res", out, 0o644)
-	}
-}
-
-func (r *runner) action(ctx context.Context, action string, args map[string]string) HostResult {
-	r.logf("host action: %s %v", action, args)
-	run := func(timeout time.Duration, env []string, a ...string) HostResult {
-		c, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		out, err := r.dc(c, env, a...)
-		code := 0
-		if err != nil {
-			code = 1
-			if ee, ok := err.(*exec.ExitError); ok {
-				code = ee.ExitCode()
+		listen := "0.0.0.0" // reachable through the LAN address too (C13)
+		args := r.coreArgs("G", "GLOBAL_PRIMARY", gPort, gPort+1, "-bootstrap=true",
+			"-broadcast-topology-file="+filepath.Join(r.shared, "topology.json"), "-broadcast-global-addr="+gBase, "-broadcast-global-node-id=G",
+			"-provision-ca-cert="+filepath.Join(r.shared, "certs", "prov.pem"), "-provision-ca-key="+filepath.Join(r.shared, "certs", "prov.key"))
+		for i, a := range args {
+			if strings.HasPrefix(a, "-http-addr=") {
+				args[i] = "-http-addr=" + listen + ":" + strconv.Itoa(gPort)
 			}
 		}
-		return HostResult{OK: err == nil, Exit: code, Out: out}
+		if err := r.startCore("G", args); err != nil {
+			return err
+		}
+		appEnv = r.appEnv("G", gPort, gPort)
+		dataDirs = []string{r.dir("G"), r.dir("app-state")}
+	case "offline":
+		if err := PKI(r.shared, map[string]string{"G": "127.0.0.1", "S1": "127.0.0.1", "W": "127.0.0.1"}); err != nil {
+			return err
+		}
+		r.proxy = newScanProxy(fmt.Sprintf("127.0.0.1:%d", proxyPort), fmt.Sprintf("127.0.0.1:%d", gPort), filepath.Join(r.shared, "markers.txt"))
+		if err := r.startCore("G", r.coreArgs("G", "ZONE", gPort, gPort+1, "-bootstrap=true", "-farm-registry-ttl=30s",
+			"-provision-ca-cert="+filepath.Join(r.shared, "certs", "prov.pem"), "-provision-ca-key="+filepath.Join(r.shared, "certs", "prov.key"))); err != nil {
+			return err
+		}
+		time.Sleep(3 * time.Second)
+		if err := r.startCore("S1", r.worker("S1", s1Port, s1Port+1, s1Port+2, gBase)); err != nil {
+			return err
+		}
+		if err := r.startCore("W", r.worker("W", wPort, wPort+5, wPort+6, fmt.Sprintf("https://127.0.0.1:%d", proxyPort))); err != nil {
+			return err
+		}
+		appEnv = r.appEnv("W", wPort, gPort)
+		dataDirs = []string{r.dir("G"), r.dir("W"), r.dir("S1"), r.dir("app-state")}
+	default:
+		return fmt.Errorf("unknown phase %q (single, offline)", phase)
 	}
+	for _, dd := range r.conf.DataDirs {
+		dataDirs = append(dataDirs, filepath.Join(r.o.AppDir, dd))
+	}
+	d, err := NewDriver(r.shared)
+	if err != nil {
+		return err
+	}
+	d.DataDirs = dataDirs
+	d.Host = func(action string, args map[string]string) HostResult { return r.action(action, args, appEnv) }
+	log.SetOutput(&prefixWriter{w: r.o.Log, prefix: "  [" + phase + "] "})
+	log.SetFlags(log.Ltime)
+	switch phase {
+	case "single":
+		d.RunSingle(ctx)
+	case "offline":
+		d.RunOffline(ctx)
+	}
+	return nil
+}
+
+func (r *runner) lanOr() string {
+	if r.lanIP != "" {
+		return r.lanIP
+	}
+	return "127.0.0.1"
+}
+
+type prefixWriter struct {
+	w      io.Writer
+	prefix string
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	for _, l := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+		fmt.Fprintf(p.w, "%s%s\n", p.prefix, l)
+	}
+	return len(b), nil
+}
+
+// action performs what the driver asks of the host.
+func (r *runner) action(action string, args map[string]string, appEnv []string) HostResult {
 	switch action {
 	case "app_start":
-		return run(2*time.Minute, nil, "up", "-d", "--no-deps", "app")
+		if r.app.running() {
+			return HostResult{OK: true}
+		}
+		p, err := r.spawn("app", r.o.AppDir, appEnv, r.conf.Start)
+		if err != nil {
+			return HostResult{Out: err.Error(), Exit: 1}
+		}
+		r.app = p
+		return HostResult{OK: true}
 	case "app_stop":
-		return run(time.Minute, nil, "stop", "-t", "30", "app")
+		r.app.stop(30 * time.Second)
+		return HostResult{OK: true}
 	case "app_pause":
-		return run(time.Minute, nil, "pause", "app")
+		r.app.signal(syscall.SIGSTOP)
+		return HostResult{OK: true}
 	case "app_unpause":
-		return run(time.Minute, nil, "unpause", "app")
+		r.app.signal(syscall.SIGCONT)
+		return HostResult{OK: true}
 	case "app_broken":
-		return run(90*time.Second, nil, "run", "--rm", "--no-deps", "-e", "HEAIN_MANIFEST="+args["manifest"], "-e", "HEAIN_INSTANCE=c1x",
-			"-e", "HEAIN_STATE_DIR=/tmp/c1x", "-e", "HEAIN_ENROLL_TOKEN=/shared/enroll/none.json", "-e", "HEAIN_ENROLL_WAIT=5s", "app")
-	case "remote_claim":
-		return run(2*time.Minute, nil, "run", "--rm", "--no-deps", "remote")
+		env := append(append([]string{}, appEnv...), "HEAIN_MANIFEST="+args["manifest"], "HEAIN_INSTANCE=c1x",
+			"HEAIN_STATE_DIR="+r.dir("c1x"), "HEAIN_ENROLL_TOKEN="+filepath.Join(r.shared, "enroll", "none.json"), "HEAIN_ENROLL_WAIT=5s")
+		p, err := r.spawn("app-broken", r.o.AppDir, env, r.conf.Start)
+		if err != nil {
+			return HostResult{Out: err.Error(), Exit: 1}
+		}
+		select {
+		case <-p.done:
+		case <-time.After(60 * time.Second):
+			p.stop(5 * time.Second)
+			return HostResult{Out: "still running after 60 s", Exit: 0}
+		}
+		p.mu.Lock()
+		out := p.out.String()
+		p.mu.Unlock()
+		return HostResult{OK: p.exitCode() == 0, Exit: p.exitCode(), Out: out}
 	case "core_restart":
-		return run(3*time.Minute, []string{"G_EXTRA=" + args["extra"]}, "up", "-d", "--no-deps", "--force-recreate", "g")
+		g := r.cores["G"]
+		g.stop(20 * time.Second)
+		a := append([]string{}, r.coreA["G"]...)
+		if e := args["extra"]; e != "" {
+			a = append(a, e)
+		}
+		p, err := r.spawn("G", r.work, nil, a)
+		if err != nil {
+			return HostResult{Out: err.Error(), Exit: 1}
+		}
+		r.cores["G"] = p
+		return HostResult{OK: true}
+	case "remote_claim":
+		if r.lanIP == "" {
+			return HostResult{Exit: 2, Out: "this machine has no non-loopback address to claim from"}
+		}
+		code, body, err := RemoteClaim(r.shared, fmt.Sprintf("https://%s:%d", r.lanIP, gPort))
+		out := fmt.Sprintf("claim through %s: %d %s %v", r.lanIP, code, strings.TrimSpace(body), err)
+		if code == 403 && strings.Contains(body, "locality_violation") {
+			return HostResult{OK: true, Exit: 0, Out: out}
+		}
+		return HostResult{Exit: 1, Out: out}
+	case "proxy_cut":
+		r.proxy.cut()
+		return HostResult{OK: true}
+	case "proxy_heal":
+		r.proxy.heal()
+		return HostResult{OK: true}
+	case "proxy_hits":
+		b, hits := r.proxy.stats()
+		n := 0
+		for _, v := range hits {
+			n += v
+		}
+		return HostResult{OK: b > 0 && n == 0, Out: fmt.Sprintf("%d bytes passed, %d marker hits %v", b, n, hits)}
 	}
-	return HostResult{Out: "unknown action " + action}
+	return HostResult{Out: "unknown action " + action, Exit: 1}
+}
+
+// ---- the proxy between W and G (C10 cut/heal, C13 inspection) ----
+
+type scanProxy struct {
+	listen, target, markersFile string
+	mu                          sync.Mutex
+	ln                          net.Listener
+	conns                       map[net.Conn]bool
+	bytes                       int64
+	hits                        map[string]int
+}
+
+func newScanProxy(listen, target, markersFile string) *scanProxy {
+	p := &scanProxy{listen: listen, target: target, markersFile: markersFile, conns: map[net.Conn]bool{}, hits: map[string]int{}}
+	p.heal()
+	return p
+}
+
+func (p *scanProxy) heal() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ln != nil {
+		return
+	}
+	l, err := net.Listen("tcp", p.listen)
+	if err != nil {
+		log.Printf("proxy: %v", err)
+		return
+	}
+	p.ln = l
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go p.serve(c)
+		}
+	}()
+}
+
+func (p *scanProxy) serve(c net.Conn) {
+	u, err := net.DialTimeout("tcp", p.target, 5*time.Second)
+	if err != nil {
+		c.Close()
+		return
+	}
+	p.mu.Lock()
+	p.conns[c], p.conns[u] = true, true
+	p.mu.Unlock()
+	done := make(chan struct{}, 2)
+	go func() { p.copyScan(u, c); done <- struct{}{} }()
+	go func() { p.copyScan(c, u); done <- struct{}{} }()
+	<-done
+	c.Close()
+	u.Close()
+	p.mu.Lock()
+	delete(p.conns, c)
+	delete(p.conns, u)
+	p.mu.Unlock()
+}
+
+func (p *scanProxy) markers() [][]byte {
+	raw, _ := os.ReadFile(p.markersFile)
+	var ms [][]byte
+	for _, l := range strings.Split(string(raw), "\n") {
+		if l = strings.TrimSpace(l); len(l) >= 6 {
+			ms = append(ms, []byte(l))
+		}
+	}
+	return ms
+}
+
+// copyScan copies src to dst and looks for every marker in the stream
+// (across read boundaries).
+func (p *scanProxy) copyScan(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	var tail []byte
+	ms, loaded := p.markers(), time.Now()
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if time.Since(loaded) > time.Second {
+				ms, loaded = p.markers(), time.Now()
+			}
+			win := append(tail, buf[:n]...)
+			p.mu.Lock()
+			p.bytes += int64(n)
+			for _, m := range ms {
+				if bytes.Contains(win, m) {
+					p.hits[string(m)]++
+				}
+			}
+			p.mu.Unlock()
+			if len(win) > 256 {
+				tail = append([]byte(nil), win[len(win)-256:]...)
+			} else {
+				tail = win
+			}
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (p *scanProxy) cut() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ln != nil {
+		p.ln.Close()
+		p.ln = nil
+	}
+	for c := range p.conns {
+		c.Close()
+	}
+	p.conns = map[net.Conn]bool{}
+}
+
+func (p *scanProxy) close() { p.cut() }
+
+func (p *scanProxy) stats() (int64, map[string]int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	h := map[string]int{}
+	for k, v := range p.hits {
+		h[k] = v
+	}
+	return p.bytes, h
 }
