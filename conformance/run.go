@@ -480,6 +480,16 @@ func (r *runner) action(action string, args map[string]string, appEnv []string) 
 			return HostResult{OK: true, Exit: 0, Out: out}
 		}
 		return HostResult{Exit: 1, Out: out}
+	case "remote_register":
+		if r.lanIP == "" {
+			return HostResult{Exit: 2, Out: "this machine has no non-loopback address to register from"}
+		}
+		code, body, err := RemoteRegister(r.shared, fmt.Sprintf("https://%s:%d", r.lanIP, gPort), args["manifest"])
+		out := fmt.Sprintf("registration through %s: %d %s %v", r.lanIP, code, strings.TrimSpace(body), err)
+		if code == 403 && strings.Contains(body, "locality_violation") {
+			return HostResult{OK: true, Exit: 0, Out: out}
+		}
+		return HostResult{Exit: 1, Out: out}
 	case "proxy_cut":
 		r.proxy.cut()
 		return HostResult{OK: true}

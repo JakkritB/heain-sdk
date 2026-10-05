@@ -1,7 +1,9 @@
 package heain
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -35,6 +37,8 @@ type fake3 struct {
 	mode      map[string]any
 	polls     int
 	lastSub   map[string]any
+	keys      map[string][]byte
+	keyCalls  int
 	extends   int
 	refuseExt bool
 	lease     time.Duration // lease granted by claim (default 1 min)
@@ -119,6 +123,23 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
 	case strings.HasPrefix(p, "/v1/app/jobs/"):
 		_, _ = w.Write([]byte(`{"ticket_id":"t-1","state":"completed","output_b64":"` + base64.StdEncoding.EncodeToString([]byte("out")) + `"}`))
+	case p == "/v1/app/keys" || strings.HasPrefix(p, "/v1/app/keys/"):
+		if f.keys == nil {
+			f.keys = map[string][]byte{}
+		}
+		if r.Method == http.MethodDelete {
+			delete(f.keys, strings.TrimPrefix(p, "/v1/app/keys/"))
+			_, _ = w.Write([]byte(`{"destroyed":true}`))
+			return
+		}
+		f.keyCalls++
+		n := body["name"].(string)
+		if f.keys[n] == nil {
+			k := make([]byte, 32)
+			_, _ = rand.Read(k)
+			f.keys[n] = k
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"key_id": n, "key_b64": f.keys[n]})
 	case p == "/v1/app/journal/events":
 		f.journal = append(f.journal, body)
 		if busy() {
@@ -534,5 +555,43 @@ func TestWorkerExtendsLease(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 		cancel()
+	}
+}
+
+func TestDataKeysAndSealer(t *testing.T) {
+	f := &fake3{}
+	a, _, _ := startFake3(t, f)
+	ctx := context.Background()
+	k1, err := a.DataKey(ctx, "accounts")
+	if err != nil || len(k1) != 32 {
+		t.Fatalf("data key: %v", err)
+	}
+	if k, _ := a.DataKey(ctx, "accounts"); string(k) != string(k1) || f.keyCalls != 1 {
+		t.Fatalf("the key is cached in memory (calls %d)", f.keyCalls)
+	}
+	s, err := a.Sealer(ctx, "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := s.Seal([]byte("citizen 1234"), []byte("accounts/1"))
+	if bytes.Contains(sealed, []byte("citizen")) {
+		t.Fatal("plaintext in sealed data")
+	}
+	if p, err := s.Open(sealed, []byte("accounts/1")); err != nil || string(p) != "citizen 1234" {
+		t.Fatalf("open: %q %v", p, err)
+	}
+	if _, err := s.Open(sealed, []byte("accounts/2")); !errors.Is(err, ErrOpen) {
+		t.Fatal("aad binds the value to its place")
+	}
+	if err := a.DestroyDataKey(ctx, "accounts"); err != nil {
+		t.Fatal(err)
+	}
+	k2, _ := a.DataKey(ctx, "accounts")
+	s2, _ := NewSealer(k2)
+	if _, err := s2.Open(sealed, []byte("accounts/1")); !errors.Is(err, ErrOpen) {
+		t.Fatal("after destruction old data cannot be opened with the new key")
+	}
+	if _, err := NewSealer([]byte("short")); err == nil {
+		t.Fatal("short key accepted")
 	}
 }

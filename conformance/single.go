@@ -268,25 +268,26 @@ func (d *Driver) c2() {
 		d.skip("C2", "app endpoints", "the app has no direct endpoints")
 		return
 	}
+	fm, fp := d.firstEndpoint() // its own method: another one would be refused by routing (405) before identity
 	st, _ = d.call(plain, "GET", strings.Replace(d.appBase, "https://", "http://", 1)+"/", nil, nil)
 	d.check("C2", "app: plain HTTP is refused", st == 0 || st >= 400, "status %d", st)
 	st, _ = d.call(tls12(d.ProbeCert, d.ProbeKey), "GET", d.appBase+"/", nil, nil)
 	d.check("C2", "app: TLS 1.2 is refused", st == 0, "status %d", st)
-	st, _ = d.call(d.client(rc, rk, ""), "POST", d.appBase+d.firstEndpointPath(), map[string]any{}, nil)
+	st, _ = d.call(d.client(rc, rk, ""), fm, d.appBase+fp, map[string]any{}, nil)
 	d.check("C2", "app: a certificate from another CA is refused", st == 0, "status %d", st)
 	ac, ak := d.certs("admin")
-	st, out := d.call(d.client(ac, ak, ""), "POST", d.appBase+d.firstEndpointPath(), map[string]any{}, nil)
+	st, out := d.call(d.client(ac, ak, ""), fm, d.appBase+fp, map[string]any{}, nil)
 	d.check("C2", "app: a certificate that is not an app certificate is refused", st == 403, "%d %s", st, errCode(out))
 	noCert := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	st, _ = d.call(noCert, "POST", d.appBase+d.firstEndpointPath(), map[string]any{}, nil)
+	st, _ = d.call(noCert, fm, d.appBase+fp, map[string]any{}, nil)
 	d.check("C2", "app: a caller without a client certificate is refused", st == 0, "status %d", st)
 }
 
-func (d *Driver) firstEndpointPath() string {
+func (d *Driver) firstEndpoint() (method, path string) {
 	for _, e := range d.Conf.Endpoints {
-		return e.Path
+		return strings.ToUpper(e.Method), e.Path
 	}
-	return "/"
+	return "POST", "/"
 }
 
 // ---- C3 registration
@@ -769,7 +770,17 @@ func (d *Driver) c9() {
 		d.check("C9", "approved -> delivered and sanitized (sensitive fields removed)", strings.Contains(string(got), strings.TrimPrefix(id, "p7-")) && len(leaked) == 0,
 			"delivered %v, leaked %v", strings.Contains(string(got), strings.TrimPrefix(id, "p7-")), leaked)
 	}
-	d.skip("C9", "data classes never leave their declared scope", "core does not filter discovery by zone/sovereignty yet (known core gap, spec 02 §11)")
+	// Data scope (core v1.3 step 4b-1): node-local data never leaves its
+	// node. Core admits providers of node-local data only from its own node
+	// and never leases their jobs to another node's Worker; the second rule
+	// is checked by core's own live test (AJ), the first here for this app.
+	if nl := d.Man.NodeLocalCapabilities(); len(nl) == 0 {
+		d.skip("C9", "node-local data stays on its node", "the app declares no node-local data class")
+	} else {
+		mj, _ := json.Marshal(d.Man)
+		r := d.host("remote_register", map[string]string{"manifest": string(mj)})
+		d.check("C9", fmt.Sprintf("registering from another host is refused for node-local data (%s)", strings.Join(nl, ", ")), r.Exit == 0, "%s", firstLine(r.Out))
+	}
 }
 
 // ---- C12 uses[]
@@ -780,8 +791,9 @@ func (d *Driver) c12() {
 	}
 	calls, bad := 0, []string{}
 	for _, e := range d.audit(gBase, gNode) {
-		if e.Action != "app.event" || !strings.HasPrefix(str(e.Detail, "app_actor"), d.Man.App.ID+".") || str(detail2(e), "ticket_id") != "" {
-			continue // not a call by the app (jobs the app ran are audited with itself as actor)
+		if e.Action != "app.event" || !strings.HasPrefix(str(e.Detail, "app_actor"), d.Man.App.ID+".") || str(detail2(e), "ticket_id") != "" ||
+			e.Actor == str(e.Detail, "app_actor") {
+			continue // not a call by the app (jobs it ran and work it audited itself, App.Audit, carry itself as actor)
 		}
 		callee := strings.SplitN(e.Actor, ".", 2)[0]
 		calls++

@@ -525,6 +525,16 @@ func aiUsed(c manifest.Capability) bool {
 // RemoteClaim tries a job claim with the probe's certificate from another
 // host (C13); core must refuse it.
 func RemoteClaim(shared, coreURL string) (int, string, error) { // coreURL: core through this machine's LAN address
+	return remotePost(shared, coreURL+"/v1/app/jobs/claim", `{"wait_s":1}`)
+}
+
+// RemoteRegister registers the app's manifest from another host (C9): core
+// must refuse a manifest with node-local data before anything else.
+func RemoteRegister(shared, coreURL, manifestJSON string) (int, string, error) {
+	return remotePost(shared, coreURL+"/v1/app/register", `{"instance_id":"c9-remote","endpoint_base":"https://127.0.0.1:1","manifest":`+manifestJSON+`}`)
+}
+
+func remotePost(shared, u, body string) (int, string, error) {
 	pool, err := core.LoadPool(filepath.Join(shared, "certs", "ca.pem"))
 	if err != nil {
 		return 0, "", err
@@ -535,7 +545,7 @@ func RemoteClaim(shared, coreURL string) (int, string, error) { // coreURL: core
 	}
 	c := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13,
 		Certificates: []tls.Certificate{pair}, RootCAs: pool, ServerName: "G"}}}
-	resp, err := c.Post(coreURL+"/v1/app/jobs/claim", "application/json", strings.NewReader(`{"wait_s":1}`))
+	resp, err := c.Post(u, "application/json", strings.NewReader(body))
 	if err != nil {
 		return 0, "", err
 	}

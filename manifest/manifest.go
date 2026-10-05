@@ -114,6 +114,28 @@ func (m Manifest) DependsOn(app, capability string) bool {
 
 // UsesCapability reports whether any dependency entry covers capability
 // (for job submission, where core, not the caller, picks the provider).
+// NodeLocalCapabilities lists the capabilities that handle a data class
+// declared sovereignty: node-local (spec 05 C9). Core admits their
+// providers only from its own node and never leases their jobs elsewhere.
+func (m Manifest) NodeLocalCapabilities() []string {
+	local := map[string]bool{}
+	for _, d := range m.DataClasses {
+		if d.Sovereignty == "node-local" {
+			local[d.Name] = true
+		}
+	}
+	var out []string
+	for _, c := range m.Capabilities {
+		for _, dc := range c.DataClasses {
+			if local[dc] {
+				out = append(out, c.Name)
+				break
+			}
+		}
+	}
+	return out
+}
+
 func (m Manifest) UsesCapability(capability string) bool {
 	for _, u := range m.Uses {
 		for _, c := range u.Capabilities {

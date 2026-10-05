@@ -55,6 +55,7 @@ type App struct {
 	Instance string
 
 	mu      sync.Mutex
+	dk      dataKeys
 	reg     core.Registration
 	opts    Options
 	pair    tls.Certificate
