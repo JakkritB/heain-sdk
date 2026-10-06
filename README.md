@@ -164,3 +164,4 @@ Uses two controls added to heain-core in Step 4a-2:
 - **`VerifyAuditRecords(prevHash, recs)`** recomputes every link (`AuditChainHash(prev, seq, ciphertext)` = SHA-256(prev ‖ seq_be64 ‖ ciphertext)) and returns the last hash, or `ErrAuditChain`.
 - **`App.SignDigest(sha256)`**, **`App.CertificatePEM()`**, **`VerifyDigest(certPEM, digest, sig)`**: sign and verify with the app key (ECDSA or RSA), e.g. checkpoint roots.
 - **Conformance:** a query string in a `conformance.yaml` path is no longer part of the endpoint match (`GET /v1/records?actor=…` matches `GET /v1/records`).
+- **`CallSpec.Timeout`** (Step 4g, 2026-10-06): a direct call is bounded by `CallSpec.Timeout`, default `DefaultCallTimeout` (30 s, as before). Calls that move large data -- heain-job calling a module's split or merge of a long video -- set a longer one.

@@ -83,7 +83,14 @@ type CallSpec struct {
 	Method, Path    string
 	Body            any // JSON-encoded unless []byte
 	Out             any // decoded from a 2xx JSON answer
+	// Timeout bounds the whole call, answer included (default
+	// DefaultCallTimeout). Calls that move large data (a module's split
+	// or merge of a long video) set a longer one.
+	Timeout time.Duration
 }
+
+// DefaultCallTimeout bounds a direct call that sets no Timeout.
+const DefaultCallTimeout = 30 * time.Second
 
 // CallError is a non-2xx answer from the called app.
 type CallError struct {
@@ -118,6 +125,12 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 	if len(cands) == 0 {
 		return 0, fmt.Errorf("heain-sdk: %s/%s: %w", cs.App, cs.Capability, ErrNoInstance)
 	}
+	to := cs.Timeout
+	if to <= 0 {
+		to = DefaultCallTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, to)
+	defer cancel()
 	a.disco.mu.Lock()
 	n := a.disco.rr[cs.Capability]
 	a.disco.rr[cs.Capability] = n + 1
@@ -210,6 +223,6 @@ func (a *App) appClient(want string) (*http.Client, error) {
 			}
 			return a.checkPeer(context.Background(), leaf)
 		}}
-	c, _ := a.clients.LoadOrStore(want, &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: tc}})
+	c, _ := a.clients.LoadOrStore(want, &http.Client{Transport: &http.Transport{TLSClientConfig: tc}})
 	return c.(*http.Client), nil
 }
