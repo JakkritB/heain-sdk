@@ -33,6 +33,7 @@ type Server struct {
 	handled  map[string]bool
 	traces   traceLanes
 	unlinked map[string]map[string]bool
+	seen     seenAssertions
 }
 
 // NewServer prepares the direct-endpoint server.
@@ -170,11 +171,15 @@ func (s *Server) wrap(ep manifest.Endpoint, c manifest.Capability, h http.Handle
 			trace = NewID()
 		}
 		lane := r.Header.Get(HeaderLane)
+		var user *User
 		audit := func(outcome string, detail map[string]any) error {
 			if !formal {
 				return nil
 			}
 			detail["method"], detail["path"] = ep.Method, ep.Path
+			if user != nil {
+				detail["user"], detail["user_assertion"] = user.ID, user.Assertion
+			}
 			return s.app.auditEvent(r.Context(), trace, c.Lane, c.Name, caller, outcome, detail)
 		}
 		if !s.app.allowedFresh(r.Context(), c.Name) {
@@ -196,8 +201,23 @@ func (s *Server) wrap(ep manifest.Endpoint, c manifest.Capability, h http.Handle
 				return
 			}
 		}
+		u, err := s.checkUser(r, ep.Public, trace)
+		if err != nil {
+			var ue *userAssertionError
+			if errors.As(err, &ue) {
+				_ = audit("refused:user_assertion_invalid", map[string]any{"reason": ue.msg})
+				writeErr(w, http.StatusUnauthorized, "user_assertion_invalid", ue.msg)
+				return
+			}
+			writeErr(w, http.StatusServiceUnavailable, "user_assertion_unavailable", err.Error())
+			return
+		}
+		user = u
 		sink := &recordSink{}
 		ctx := context.WithValue(WithTrace(r.Context(), trace, c.Lane), keyCaller, caller)
+		if user != nil {
+			ctx = context.WithValue(ctx, userKey{}, user)
+		}
 		ctx = context.WithValue(ctx, keyRecords, sink)
 		rec := &recorder{hdr: http.Header{}}
 		h.ServeHTTP(rec, r.WithContext(ctx))

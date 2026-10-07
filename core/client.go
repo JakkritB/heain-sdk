@@ -167,6 +167,8 @@ type Info struct {
 	NodeID      string   `json:"node_id"`
 	Tier        string   `json:"tier"`
 	Mode        string   `json:"mode"`
+	// UserAssertionIssuers are the gateway apps (core gateway.apps).
+	UserAssertionIssuers []string `json:"user_assertion_issuers,omitempty"`
 }
 
 func (c *Client) Info(ctx context.Context) (Info, error) {

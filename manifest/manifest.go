@@ -77,6 +77,9 @@ type Endpoint struct {
 	Path       string `json:"path" yaml:"path"`
 	Capability string `json:"capability" yaml:"capability"`
 	Formal     *bool  `json:"formal" yaml:"formal"`
+	// Public: people may reach this endpoint through a gateway app, once
+	// core's gateway.exposures (approved through P5) exposes it.
+	Public bool `json:"public,omitempty" yaml:"public,omitempty"`
 }
 
 // Use is one declared dependency. App and each capability may be a

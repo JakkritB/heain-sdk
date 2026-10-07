@@ -74,6 +74,7 @@ type App struct {
 	modeDone chan struct{}
 	seqMu    sync.Mutex // journal app_seq counter
 	certs    certCache  // peer certificate status (revocation.go)
+	issuers  issuerCache
 }
 
 // ErrIdentity is returned when the certificate's CN is not <app-id>.<instance-id>.

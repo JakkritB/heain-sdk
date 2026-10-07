@@ -165,3 +165,23 @@ Uses two controls added to heain-core in Step 4a-2:
 - **`App.SignDigest(sha256)`**, **`App.CertificatePEM()`**, **`VerifyDigest(certPEM, digest, sig)`**: sign and verify with the app key (ECDSA or RSA), e.g. checkpoint roots.
 - **Conformance:** a query string in a `conformance.yaml` path is no longer part of the endpoint match (`GET /v1/records?actor=…` matches `GET /v1/records`).
 - **`CallSpec.Timeout`** (Step 4g, 2026-10-06): a direct call is bounded by `CallSpec.Timeout`, default `DefaultCallTimeout` (30 s, as before). Calls that move large data -- heain-job calling a module's split or merge of a long video -- set a longer one.
+
+## Step 4.6a-2: people through a gateway app (2026-10-07)
+
+heain-core 4.6a lets people reach apps through a gateway app (heain-gateway). The author decided: the manifest declares which endpoints may be public, and P5 approves exposing them; the user reaches the app as a signed assertion; the gateway checks roles, and the app checks data-level rights.
+
+- **Manifest:** `endpoints[].public: true` marks an endpoint people may reach. Declaring it exposes nothing; core's `gateway.exposures`, approved through P5, does.
+- **In the app:** `heain.UserOf(ctx)` is the signed-in person of the request (`ID`, `Name`, `Roles`, `AuthMethod`, `Session`, `Gateway`, `HasRole`), or nil for a call from an app or an anonymous route. Data-level checks ("is this record theirs?") are the app's.
+- **What the server checks** (`X-Heain-User`, before the handler runs):
+  - the caller is an instance of a gateway app (core's `/v1/app/info` → `user_assertion_issuers`, cached 15 s);
+  - the assertion is signed with the key of the certificate the call came with;
+  - it is for this app, this method and path, and this trace id;
+  - it is at most 2 minutes old, and each id is used only once;
+  - the endpoint is declared public.
+
+  A refusal is `401 user_assertion_invalid` (audited for a formal endpoint).
+- **Audit:** the formal event carries `user` and the whole signed `user_assertion`. `heain.ParseUserAssertion` + `heain.VerifyUserAssertion(u, gatewayCert)` prove later who acted.
+- **For a gateway app:**
+  - `App.GatewayRoutes(ctx)`: the exposed routes, with their roles, rate, auth and live instances.
+  - `App.AppClient(app, instance)`: an mTLS client that only talks to that instance.
+  - `App.SignUserAssertion(UserAssertion{aud, method, path, trace, sub, roles, amr, sid})`: the header value.
