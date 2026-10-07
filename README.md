@@ -205,3 +205,16 @@ heain-consent (Step 4.6d) carries out a person's access, portability and erasure
 - **Something kept after its identifiers are erased:** remember `r.Subject` with it, so the override pass still finds it.
 - **Who may call:** only heain-consent (`SubjectRights.Callers` to change); other apps get 403. Bodies are validated (1–64 identifiers, kinds `[a-z0-9_.-]`) before the app sees them.
 - **`CallSpec.Instance`:** a direct call to one chosen instance of an app, for work that must reach every instance (heain-consent calls each `subject.rights` instance).
+
+## Step 4.6e-2: models from the registry (2026-10-07)
+
+heain-model (Step 4.6e) is the model registry; the weights live in heain-files. The author decided that apps pull and verify, and that an unregistered hash is reported, not blocked.
+
+- **`App.Model(ctx, name, dir)`:**
+  - asks heain-model which version this instance runs (production, or a canary for a share of instances);
+  - downloads it from heain-files on this node, chunk by chunk, into `dir` (default `<state>/models`), reusing a verified copy;
+  - checks the sha256 and the size against the registry. A file that does not match is refused and not kept.
+
+  Put `art.SHA256` and `art.Runtime` in `Decision.ModelSHA256` / `Runtime` so the AI record names the weights. Declare `uses: heain-model [model.resolve]` and `heain-files [files.read]`. `App.ResolveModel` only asks.
+- **`App.Broadcasts(ctx, after, limit)`:** the P7 traffic this node received from this app's instances elsewhere (core Step 4.6e `GET /v1/app/broadcasts`; RAW in the zone, DISTILLED and its rule from other zones). Each entry has a sequence number; the node's log is in memory and starts empty when the node starts.
+- **`Requirements.Node`:** a job only the named node's app may lease, either the submitting node or a farm Worker (core Step 4.6e). heain-model uses it to send a model's chunks to the node that keeps a copy.

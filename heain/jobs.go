@@ -27,6 +27,9 @@ type Requirements struct {
 	MinMemoryMB    uint64 `json:"min_memory_mb,omitempty"`
 	GPU            string `json:"gpu,omitempty"` // none | optional | required
 	MinGPUMemoryMB uint64 `json:"min_gpu_memory_mb,omitempty"`
+	// Node, when set, is the only node whose app may lease the job: the
+	// submitting node or a farm Worker by its node id (core Step 4.6e).
+	Node string `json:"node,omitempty"`
 }
 
 // JobRequest submits work for an execution: job capability (P1).
