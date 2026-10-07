@@ -73,7 +73,7 @@ func StartFromEnv(ctx context.Context) (*App, error) {
 	if err := manifest.Validate(m); err != nil {
 		return nil, err
 	}
-	if err := manifest.CheckSDK(m, SDKName, SDKVersion); err != nil {
+	if err := checkSDK(m); err != nil {
 		return nil, err
 	}
 	if o.InstanceID == "" || o.Core.NodeID == "" || o.Core.CAFile == "" {

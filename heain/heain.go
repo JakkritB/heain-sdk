@@ -28,7 +28,19 @@ import (
 const (
 	SDKName    = "heain-sdk-go"
 	SDKVersion = "1.0.0"
+	// AgentName is heain-agent, the sidecar that runs this SDK for an app
+	// in another language (Step 5, 2026-10-08): its manifests name it.
+	AgentName    = "heain-agent"
+	AgentVersion = "1.0.0"
 )
+
+// checkSDK accepts a manifest whose app.sdk names this SDK or heain-agent.
+func checkSDK(m manifest.Manifest) error {
+	if m.App.SDK.Name == AgentName {
+		return manifest.CheckSDK(m, AgentName, AgentVersion)
+	}
+	return manifest.CheckSDK(m, SDKName, SDKVersion)
+}
 
 // Options configure Start.
 type Options struct {
@@ -95,7 +107,7 @@ func Start(ctx context.Context, o Options) (*App, error) {
 	if err := manifest.Validate(m); err != nil {
 		return nil, err
 	}
-	if err := manifest.CheckSDK(m, SDKName, SDKVersion); err != nil {
+	if err := checkSDK(m); err != nil {
 		return nil, err
 	}
 	if o.InstanceID == "" {

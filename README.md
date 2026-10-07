@@ -234,3 +234,7 @@ heain-report (Step 4.6h) makes reports and dashboards. The author decided that i
 - **Helpers:**
   - `NewReportAggregator(d, q)`, then `Add(t, dims, values, row)` for each record and `Result()`, for apps that keep records in a plain store;
   - `MergeReportGroups` adds up answers from several instances (counts and sums add, min and max compare).
+
+## Step 5d: heain-agent (2026-10-08)
+
+[heain-agent](https://github.com/heainframework/heain-agent) is heain-sdk run as a sidecar, for apps in other languages. A manifest may name it (`app.sdk: {name: heain-agent, version: ">=1.0.0"}`); `StartFromEnv` accepts that as it accepts `heain-sdk-go` (`heain.AgentName`, `heain.AgentVersion`), since the agent enforces the same rules.
