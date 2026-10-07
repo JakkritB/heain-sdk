@@ -218,3 +218,19 @@ heain-model (Step 4.6e) is the model registry; the weights live in heain-files. 
   Put `art.SHA256` and `art.Runtime` in `Decision.ModelSHA256` / `Runtime` so the AI record names the weights. Declare `uses: heain-model [model.resolve]` and `heain-files [files.read]`. `App.ResolveModel` only asks.
 - **`App.Broadcasts(ctx, after, limit)`:** the P7 traffic this node received from this app's instances elsewhere (core Step 4.6e `GET /v1/app/broadcasts`; RAW in the zone, DISTILLED and its rule from other zones). Each entry has a sequence number; the node's log is in memory and starts empty when the node starts.
 - **`Requirements.Node`:** a job only the named node's app may lease, either the submitting node or a farm Worker (core Step 4.6e). heain-model uses it to send a model's chunks to the node that keeps a copy.
+
+## Step 4.6h-1: report sources (2026-10-07)
+
+heain-report (Step 4.6h) makes reports and dashboards. The author decided that it never reads another app's store: an app that holds data offers aggregates through a shared capability, groups smaller than a report's `min_group` are hidden, and rows come only for a run an Approver approved (P5).
+
+- **The contract:** declare `report.source` (version 1, execution direct) with `GET /v1/report-source/datasets` (formal: false) and `POST /v1/report-source/query` (formal: true). In code, `srv.HandleReportSource(heain.ReportSource{Datasets, Query})`.
+- **A dataset:** `ReportDataset{Name, Dimensions, Measures [{Name, Agg: count | sum | min | max, Unit}], Detail}`. `ValidateReportDatasets` checks it when the handler is registered.
+- **A query:** `ReportQuery{Report, Run, Dataset, From, To, GroupBy, Filter, Measures, Detail, DetailAction, MaxRows}`. The answer is `ReportResult{Groups [{Keys, Count, Values}], Rows, Truncated}`. `Count` is the number of records in a group; heain-report uses it to hide small groups.
+- **What the SDK checks first:**
+  - only heain-report may call (`ReportSource.Callers` to change); other apps get 403;
+  - the window, the dimensions, the filter and the measures must belong to the dataset;
+  - detail needs a dataset that gives it and the run's P5 action;
+  - rows are dropped from an answer that was not for detail and cut at `MaxRows` (at most 10000).
+- **Helpers:**
+  - `NewReportAggregator(d, q)`, then `Add(t, dims, values, row)` for each record and `Result()`, for apps that keep records in a plain store;
+  - `MergeReportGroups` adds up answers from several instances (counts and sums add, min and max compare).
