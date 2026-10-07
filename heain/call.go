@@ -80,9 +80,12 @@ var ErrNoInstance = errors.New("no live instance provides this capability")
 type CallSpec struct {
 	App, Capability string
 	Version         int
-	Method, Path    string
-	Body            any // JSON-encoded unless []byte
-	Out             any // decoded from a 2xx JSON answer
+	// Instance, when set, calls only that instance of App (for work that
+	// must reach every instance, such as a data-subject request).
+	Instance     string
+	Method, Path string
+	Body         any // JSON-encoded unless []byte
+	Out          any // decoded from a 2xx JSON answer
 	// Timeout bounds the whole call, answer included (default
 	// DefaultCallTimeout). Calls that move large data (a module's split
 	// or merge of a long video) set a longer one.
@@ -118,7 +121,7 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 	}
 	var cands []Instance
 	for _, in := range insts {
-		if in.AppID == cs.App && in.Execution == "direct" && in.EndpointBase != "" {
+		if in.AppID == cs.App && in.Execution == "direct" && in.EndpointBase != "" && (cs.Instance == "" || in.InstanceID == cs.Instance) {
 			cands = append(cands, in)
 		}
 	}

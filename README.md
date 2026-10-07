@@ -185,3 +185,23 @@ heain-core 4.6a lets people reach apps through a gateway app (heain-gateway). Th
   - `App.GatewayRoutes(ctx)`: the exposed routes, with their roles, rate, auth and live instances.
   - `App.AppClient(app, instance)`: an mTLS client that only talks to that instance.
   - `App.SignUserAssertion(UserAssertion{aud, method, path, trace, sub, roles, amr, sid})`: the header value.
+
+## Step 4.6d-1: data-subject rights (2026-10-07)
+
+heain-consent (Step 4.6d) carries out a person's access, portability and erasure requests in every app that holds personal data. The author decided on a shared capability that heain-consent finds through core's discover.
+
+- **Declare it** (an app that holds personal data):
+  - the capability `subject.rights` (version 1, direct);
+  - `POST /v1/subject-rights/export` and `POST /v1/subject-rights/erase`;
+  - in code, `srv.HandleSubjectRights(heain.SubjectRights{Export, Erase})`.
+- **The request** (`heain.SubjectRequest`):
+  - `request`, `subject` (heain-consent's opaque id), and every identifier heain-consent knows: `gateway_user`, `email`, `phone`, or `<app>:<kind>`;
+  - `dry_run` (erase: answer, change nothing);
+  - `override`: an approved `RETENTION_OVERRIDE`, so what was held is erased too.
+- **Matching:** `r.Has(kind, value)` and `r.Values(kind)` compare in normal form (`heain.NormalizeIdentifier`: e-mail lower-cased, phone `+` and digits).
+- **The answers:**
+  - export: `{items: [{kind, id, data}]}`;
+  - erase: `{erased: [...], held: [{kind, id, reason, until}]}`. An erase answer never carries data; the SDK strips it.
+- **Something kept after its identifiers are erased:** remember `r.Subject` with it, so the override pass still finds it.
+- **Who may call:** only heain-consent (`SubjectRights.Callers` to change); other apps get 403. Bodies are validated (1–64 identifiers, kinds `[a-z0-9_.-]`) before the app sees them.
+- **`CallSpec.Instance`:** a direct call to one chosen instance of an app, for work that must reach every instance (heain-consent calls each `subject.rights` instance).
