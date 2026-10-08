@@ -169,6 +169,9 @@ type Info struct {
 	Mode        string   `json:"mode"`
 	// UserAssertionIssuers are the gateway apps (core gateway.apps).
 	UserAssertionIssuers []string `json:"user_assertion_issuers,omitempty"`
+	// ZoneMaster is the node id of this node's zone Master (this node's id
+	// when it is the Master; core with zone keys, Stage B-1d).
+	ZoneMaster string `json:"zone_master,omitempty"`
 }
 
 func (c *Client) Info(ctx context.Context) (Info, error) {

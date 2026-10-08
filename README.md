@@ -256,3 +256,5 @@ Package `zonesync` is the network side of keeping an app's data the same on ever
 - `zonesync.Handler(app, log)` serves the log to other instances of the same app only (403 otherwise).
 - `zonesync.Puller` finds the other instances with zone discovery and pulls their logs (`Once`, `Run`); newer wins, by the write's time, then its origin.
 - `Puller.Poke` asks every other instance to pull now (`PokeHandler` serves it), for revocations that must not wait for the next round.
+
+Stage B-1d (2026-10-08): `core.Info` (`App.Core.Info`) carries `ZoneMaster`, the node id of this node's zone Master (this node's own id when it is the Master), from core's `GET /v1/app/info` `zone_master`. heain-audit uses it to send its checkpoints to the heain-audit there.
