@@ -247,3 +247,12 @@ The author decided that an app may keep its data on every node of its zone (a Ma
 - **`App.DestroyZoneKey(ctx, name)`**: crypto-shred on the custodian first, then on every node through tombstones (matched by the key's fingerprint, so a key made again under the same name is not destroyed). A cached copy lives at most `ZoneKeyTTL` (60 s) in a process.
 - **`App.DiscoverZone(ctx, capability, version)`**: instances on every node of the zone, each with its `Node`; `complete` is false when a node could not be asked.
 - **`CallSpec.Scope = heain.ScopeZone`**: `Call` finds the callee with `DiscoverZone`.
+
+## Stage B-1c: zonesync (2026-10-08)
+
+Package `zonesync` is the network side of keeping an app's data the same on every node of its zone, the mechanism heain-database and heain-gateway share (author decision 2026-10-08):
+
+- The app seals its records under a zone key and keeps its own change log (`zonesync.Log`: `Epoch`, `Changes`, `Last`, `Apply`); the SDK adds no storage dependency.
+- `zonesync.Handler(app, log)` serves the log to other instances of the same app only (403 otherwise).
+- `zonesync.Puller` finds the other instances with zone discovery and pulls their logs (`Once`, `Run`); newer wins, by the write's time, then its origin.
+- `Puller.Poke` asks every other instance to pull now (`PokeHandler` serves it), for revocations that must not wait for the next round.
