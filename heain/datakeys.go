@@ -22,6 +22,7 @@ import (
 type dataKeys struct {
 	mu   sync.Mutex
 	keys map[string][]byte
+	zone map[string]zoneKeyEntry // zone.go
 }
 
 // DataKey returns the app's 256-bit data key name (created in core's KMS

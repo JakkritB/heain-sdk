@@ -130,19 +130,29 @@ func (f *fake3) h(w http.ResponseWriter, r *http.Request) {
 		if f.keys == nil {
 			f.keys = map[string][]byte{}
 		}
+		zone := r.URL.Query().Get("scope") == "zone" || body["scope"] == "zone"
 		if r.Method == http.MethodDelete {
-			delete(f.keys, strings.TrimPrefix(p, "/v1/app/keys/"))
+			n := strings.TrimPrefix(p, "/v1/app/keys/")
+			if zone {
+				n = "zone:" + n
+			}
+			delete(f.keys, n)
 			_, _ = w.Write([]byte(`{"destroyed":true}`))
 			return
 		}
 		f.keyCalls++
 		n := body["name"].(string)
+		if zone {
+			n = "zone:" + n
+		}
 		if f.keys[n] == nil {
 			k := make([]byte, 32)
 			_, _ = rand.Read(k)
 			f.keys[n] = k
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"key_id": n, "key_b64": f.keys[n]})
+	case p == "/v1/app/discover" && r.URL.Query().Get("scope") == "zone":
+		_, _ = w.Write([]byte(`{"instances":[{"app_id":"a","instance_id":"g1","execution":"direct","endpoint_base":"https://g","node":"G"},{"app_id":"a","instance_id":"w1","execution":"direct","endpoint_base":"https://w","node":"W"}],"complete":false}`))
 	case p == "/v1/app/journal/events":
 		f.journal = append(f.journal, body)
 		if busy() {
@@ -635,5 +645,42 @@ func TestAuditChainHelpers(t *testing.T) {
 	d2 := sha256.Sum256([]byte("other"))
 	if VerifyDigest(a.CertificatePEM(), d2[:], sig) == nil {
 		t.Fatal("wrong digest verified")
+	}
+}
+
+func TestZoneKeysAndDiscovery(t *testing.T) {
+	f := &fake3{}
+	a, _, _ := startFake3(t, f)
+	ctx := context.Background()
+	zk, err := a.ZoneKey(ctx, "inside")
+	if err != nil || len(zk) != 32 {
+		t.Fatalf("zone key: %v", err)
+	}
+	nk, _ := a.DataKey(ctx, "inside")
+	if string(nk) == string(zk) {
+		t.Fatal("zone and node keys of one name must differ")
+	}
+	calls := f.keyCalls
+	if k, _ := a.ZoneKey(ctx, "inside"); string(k) != string(zk) || f.keyCalls != calls {
+		t.Fatal("the zone key is cached")
+	}
+	old := ZoneKeyTTL
+	ZoneKeyTTL = 0
+	defer func() { ZoneKeyTTL = old }()
+	if _, _ = a.ZoneKey(ctx, "inside"); f.keyCalls != calls+1 {
+		t.Fatal("past ZoneKeyTTL the zone key is asked again (a destroy elsewhere must reach this process)")
+	}
+	if err := a.DestroyZoneKey(ctx, "inside"); err != nil {
+		t.Fatal(err)
+	}
+	if k, _ := a.ZoneKey(ctx, "inside"); string(k) == string(zk) {
+		t.Fatal("destroyed zone key still returned")
+	}
+	if k, _ := a.DataKey(ctx, "inside"); string(k) != string(nk) {
+		t.Fatal("destroying the zone key must not touch the node key")
+	}
+	insts, complete, err := a.DiscoverZone(ctx, "x.cap", 0)
+	if err != nil || complete || len(insts) != 2 || insts[1].Node != "W" || insts[1].EndpointBase != "https://w" {
+		t.Fatalf("zone discovery: %+v %v %v", insts, complete, err)
 	}
 }

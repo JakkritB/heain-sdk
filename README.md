@@ -238,3 +238,12 @@ heain-report (Step 4.6h) makes reports and dashboards. The author decided that i
 ## Step 5d: heain-agent (2026-10-08)
 
 [heain-agent](https://github.com/heainframework/heain-agent) is heain-sdk run as a sidecar, for apps in other languages. A manifest may name it (`app.sdk: {name: heain-agent, version: ">=1.0.0"}`); `StartFromEnv` accepts that as it accepts `heain-sdk-go` (`heain.AgentName`, `heain.AgentVersion`), since the agent enforces the same rules.
+
+## Stage B-1a: zone keys and zone discovery (2026-10-08)
+
+The author decided that an app may keep its data on every node of its zone (a Master's farm), never across zones (P7), and that only sealed data travels. Core keeps zone app keys for this; the SDK gives:
+
+- **`App.ZoneKey(ctx, name)`** (and `ZoneSealer`): a data key that every instance of the app on every node of the zone gets. The zone's Master is its custodian; each node keeps its own copy, so a node cut off from its Master keeps opening its data. Asking for a key this node does not hold yet needs the Master (503 `zone_unavailable`, retryable). Only an app whose manifest declares a data class wider than `node-local` may ask (403 `sovereignty_violation`).
+- **`App.DestroyZoneKey(ctx, name)`**: crypto-shred on the custodian first, then on every node through tombstones (matched by the key's fingerprint, so a key made again under the same name is not destroyed). A cached copy lives at most `ZoneKeyTTL` (60 s) in a process.
+- **`App.DiscoverZone(ctx, capability, version)`**: instances on every node of the zone, each with its `Node`; `complete` is false when a node could not be asked.
+- **`CallSpec.Scope = heain.ScopeZone`**: `Call` finds the callee with `DiscoverZone`.

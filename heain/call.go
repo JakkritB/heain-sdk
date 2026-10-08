@@ -82,7 +82,10 @@ type CallSpec struct {
 	Version         int
 	// Instance, when set, calls only that instance of App (for work that
 	// must reach every instance, such as a data-subject request).
-	Instance     string
+	Instance string
+	// Scope "zone" (ScopeZone) finds the callee on every node of this
+	// node's zone (DiscoverZone) instead of this node only (Stage B).
+	Scope        string
 	Method, Path string
 	Body         any // JSON-encoded unless []byte
 	Out          any // decoded from a 2xx JSON answer
@@ -115,9 +118,20 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 	if !a.declares(cs.App, cs.Capability) {
 		return 0, fmt.Errorf("heain-sdk: %s/%s %w", cs.App, cs.Capability, ErrNotDeclared)
 	}
-	insts, err := a.Discover(ctx, cs.Capability, cs.Version)
-	if err != nil {
-		return 0, err
+	var insts []Instance
+	if cs.Scope == ScopeZone {
+		zi, _, err := a.DiscoverZone(ctx, cs.Capability, cs.Version)
+		if err != nil {
+			return 0, err
+		}
+		for _, z := range zi {
+			insts = append(insts, z.Instance)
+		}
+	} else {
+		var err error
+		if insts, err = a.Discover(ctx, cs.Capability, cs.Version); err != nil {
+			return 0, err
+		}
 	}
 	var cands []Instance
 	for _, in := range insts {
@@ -135,6 +149,9 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 	a.disco.mu.Lock()
+	if a.disco.rr == nil {
+		a.disco.rr = map[string]int{} // a zone call can come before any Discover
+	}
 	n := a.disco.rr[cs.Capability]
 	a.disco.rr[cs.Capability] = n + 1
 	a.disco.mu.Unlock()
