@@ -258,3 +258,8 @@ Package `zonesync` is the network side of keeping an app's data the same on ever
 - `Puller.Poke` asks every other instance to pull now (`PokeHandler` serves it), for revocations that must not wait for the next round.
 
 Stage B-1d (2026-10-08): `core.Info` (`App.Core.Info`) carries `ZoneMaster`, the node id of this node's zone Master (this node's own id when it is the Master), from core's `GET /v1/app/info` `zone_master`. heain-audit uses it to send its checkpoints to the heain-audit there.
+
+Stage B-1e (2026-10-08), large data by reference:
+- `App.Stream(ctx, CallSpec, header, body)`: a direct call with the same checks as `Call`, streamed both ways -- the request body is sent as it is read, request headers such as `Range` pass through, and the answer comes back unread (`*Stream`, with the `Instance` that answered; close it). `CallSpec.Timeout` bounds the whole call when set; otherwise only the context does.
+- `heain.StreamBody(w)`, called by a handler before it writes, sends the answer as it is written instead of after the handler returns; the formal audit event is written at the first byte or status (detail `streamed: true`), and if it cannot be the caller gets 503 `audit_unavailable` and nothing else. Used by heain-files for file content.
+- Conformance C11: after core restarts, the suite waits until the companions are discoverable again before calling the app.

@@ -78,6 +78,7 @@ endpoints:
   - {method: POST, path: /v1/classify-forgetful, capability: svc.classify, formal: true}
   - {method: POST, path: /v1/id, capability: id.check, formal: true}
   - {method: POST, path: /v1/ballot, capability: ballot.cast, formal: true}
+  - {method: POST, path: /v1/stream, capability: svc.greet, formal: true}
 lanes: {unlinkable: [[identity, ballot]]}
 `
 
@@ -141,6 +142,7 @@ func startEnv(t *testing.T) *env {
 	must(srv.HandleFunc("POST /v1/classify-forgetful", ok))
 	must(srv.HandleFunc("POST /v1/id", ok))
 	must(srv.HandleFunc("POST /v1/ballot", ok))
+	must(srv.HandleFunc("POST /v1/stream", streamHandler))
 	if err := srv.HandleFunc("POST /v1/undeclared", ok); err == nil {
 		t.Fatal("an undeclared endpoint must be refused")
 	}

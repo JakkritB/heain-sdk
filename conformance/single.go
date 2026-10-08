@@ -315,6 +315,32 @@ func (d *Driver) discovered() bool {
 	return false
 }
 
+// depDiscovered: a companion's first capability finds the companion's
+// instance (it is registered and heartbeating with core).
+func (d *Driver) depDiscovered(dp Dep) bool {
+	m, err := manifest.Load(dp.Manifest)
+	if err != nil || len(m.Capabilities) == 0 {
+		return true // nothing to wait for
+	}
+	st, out := d.probeDo(gBase, gNode, "GET", "/v1/app/discover?capability="+m.Capabilities[0].Name, nil)
+	if st != 200 {
+		return false
+	}
+	var r struct {
+		Instances []struct {
+			AppID      string `json:"app_id"`
+			InstanceID string `json:"instance_id"`
+		} `json:"instances"`
+	}
+	_ = json.Unmarshal(out, &r)
+	for _, in := range r.Instances {
+		if in.AppID == dp.AppID && in.InstanceID == dp.Instance {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Driver) c3() {
 	time.Sleep(12 * time.Second)
 	d.check("C3", "heartbeats keep it live past the TTL (10 s)", d.discovered() && d.appStatus(gBase, gNode, d.Man.App.ID, d.Instance) == "active", "")
@@ -823,6 +849,15 @@ func (d *Driver) c11(ctx context.Context) {
 	}
 	ok := waitFor(60*time.Second, func() bool { return d.appStatus(gBase, gNode, d.Man.App.ID, d.Instance) == "active" && d.discovered() })
 	d.check("C11", "C3 again: the app keeps its registration live with the newer core", ok, "")
+	// the companions (not under test) re-register too before the app is called again
+	waitFor(90*time.Second, func() bool {
+		for _, dp := range d.Conf.Deps {
+			if !d.depDiscovered(dp) {
+				return false
+			}
+		}
+		return true
+	})
 	var calls []callRec
 	for _, c := range d.Conf.Endpoints {
 		_, cp, _ := d.endpointFor(c.Method, c.Path)

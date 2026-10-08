@@ -125,6 +125,14 @@ type recorder struct {
 	hdr    http.Header
 	status int
 	body   bytes.Buffer
+	// a streamed answer (StreamBody): at the first byte or status the
+	// checks and the formal audit run (finish), then the body goes straight
+	// to the client
+	stream bool
+	finish func(status int) bool
+	sent   bool // finish ran
+	ok     bool // finish passed: writes go to out
+	out    http.ResponseWriter
 }
 
 func (r *recorder) Header() http.Header { return r.hdr }
@@ -132,12 +140,45 @@ func (r *recorder) WriteHeader(code int) {
 	if r.status == 0 {
 		r.status = code
 	}
+	if r.stream && !r.sent {
+		r.sent = true
+		r.ok = r.finish(r.status)
+	}
 }
 func (r *recorder) Write(b []byte) (int, error) {
 	if r.status == 0 {
-		r.status = http.StatusOK
+		r.WriteHeader(http.StatusOK)
+	}
+	if r.stream {
+		if !r.ok {
+			return 0, errStreamRefused
+		}
+		return r.out.Write(b)
 	}
 	return r.body.Write(b)
+}
+
+// Flush passes a flush on to a streamed answer.
+func (r *recorder) Flush() {
+	if r.stream && r.ok {
+		if f, ok := r.out.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+var errStreamRefused = errors.New("heain-sdk: the streamed answer was withheld (its formal audit failed)")
+
+// StreamBody makes the answer of the endpoint being served go to the caller
+// as it is written instead of after the handler returns (Stage B-1e: a
+// file's content). Call it before writing anything. The formal audit is
+// written when the status is set or the first byte written; if it cannot
+// be, the caller gets 503 audit_unavailable and every Write fails. Without
+// a heain-sdk server around w it does nothing.
+func StreamBody(w http.ResponseWriter) {
+	if r, ok := w.(*recorder); ok && r.status == 0 {
+		r.stream = true
+	}
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
@@ -219,37 +260,51 @@ func (s *Server) wrap(ep manifest.Endpoint, c manifest.Capability, h http.Handle
 			ctx = context.WithValue(ctx, userKey{}, user)
 		}
 		ctx = context.WithValue(ctx, keyRecords, sink)
-		rec := &recorder{hdr: http.Header{}}
+		rec := &recorder{hdr: http.Header{}, out: w}
+		rec.finish = func(status int) bool {
+			ids := sink.list()
+			if recordRequired && status < 400 && len(ids) == 0 {
+				_ = audit("error:reasoning_record_missing", map[string]any{"status": status})
+				s.app.logf("heain-sdk: %s %s answered without the reasoning record %s requires -- refused", ep.Method, ep.Path, c.Name)
+				writeErr(w, http.StatusInternalServerError, "reasoning_record_missing", c.Name+" uses AI and must send a reasoning record (App.Reason) for every decision")
+				return false
+			}
+			outcome := "ok"
+			if status >= 400 {
+				outcome = fmt.Sprintf("error:%d", status)
+			}
+			detail := map[string]any{"status": status}
+			if len(ids) > 0 {
+				detail["reasoning_record_ids"] = ids
+			}
+			if rec.stream {
+				detail["streamed"] = true
+			}
+			if err := audit(outcome, detail); err != nil {
+				s.app.logf("heain-sdk: audit of %s %s failed, response withheld: %v", ep.Method, ep.Path, err)
+				writeErr(w, http.StatusServiceUnavailable, "audit_unavailable", "the formal process could not be logged")
+				return false
+			}
+			for k, v := range rec.hdr {
+				w.Header()[k] = v
+			}
+			w.Header().Set(HeaderTrace, trace)
+			w.WriteHeader(status)
+			return true
+		}
 		h.ServeHTTP(rec, r.WithContext(ctx))
 		if rec.status == 0 {
 			rec.status = http.StatusOK
 		}
-		ids := sink.list()
-		if recordRequired && rec.status < 400 && len(ids) == 0 {
-			_ = audit("error:reasoning_record_missing", map[string]any{"status": rec.status})
-			s.app.logf("heain-sdk: %s %s answered without the reasoning record %s requires -- refused", ep.Method, ep.Path, c.Name)
-			writeErr(w, http.StatusInternalServerError, "reasoning_record_missing", c.Name+" uses AI and must send a reasoning record (App.Reason) for every decision")
+		if rec.stream {
+			if !rec.sent {
+				rec.WriteHeader(rec.status)
+			}
 			return
 		}
-		outcome := "ok"
-		if rec.status >= 400 {
-			outcome = fmt.Sprintf("error:%d", rec.status)
+		if rec.finish(rec.status) {
+			_, _ = w.Write(rec.body.Bytes())
 		}
-		detail := map[string]any{"status": rec.status}
-		if len(ids) > 0 {
-			detail["reasoning_record_ids"] = ids
-		}
-		if err := audit(outcome, detail); err != nil {
-			s.app.logf("heain-sdk: audit of %s %s failed, response withheld: %v", ep.Method, ep.Path, err)
-			writeErr(w, http.StatusServiceUnavailable, "audit_unavailable", "the formal process could not be logged")
-			return
-		}
-		for k, v := range rec.hdr {
-			w.Header()[k] = v
-		}
-		w.Header().Set(HeaderTrace, trace)
-		w.WriteHeader(rec.status)
-		_, _ = w.Write(rec.body.Bytes())
 	})
 }
 

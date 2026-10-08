@@ -115,32 +115,9 @@ func (e *CallError) Error() string {
 // carried on unless the callee's lane differs from ctx's lane, in which case
 // a fresh one is started (so no id crosses lanes).
 func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
-	if !a.declares(cs.App, cs.Capability) {
-		return 0, fmt.Errorf("heain-sdk: %s/%s %w", cs.App, cs.Capability, ErrNotDeclared)
-	}
-	var insts []Instance
-	if cs.Scope == ScopeZone {
-		zi, _, err := a.DiscoverZone(ctx, cs.Capability, cs.Version)
-		if err != nil {
-			return 0, err
-		}
-		for _, z := range zi {
-			insts = append(insts, z.Instance)
-		}
-	} else {
-		var err error
-		if insts, err = a.Discover(ctx, cs.Capability, cs.Version); err != nil {
-			return 0, err
-		}
-	}
-	var cands []Instance
-	for _, in := range insts {
-		if in.AppID == cs.App && in.Execution == "direct" && in.EndpointBase != "" && (cs.Instance == "" || in.InstanceID == cs.Instance) {
-			cands = append(cands, in)
-		}
-	}
-	if len(cands) == 0 {
-		return 0, fmt.Errorf("heain-sdk: %s/%s: %w", cs.App, cs.Capability, ErrNoInstance)
+	target, err := a.callTarget(ctx, cs)
+	if err != nil {
+		return 0, err
 	}
 	to := cs.Timeout
 	if to <= 0 {
@@ -148,19 +125,6 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
-	a.disco.mu.Lock()
-	if a.disco.rr == nil {
-		a.disco.rr = map[string]int{} // a zone call can come before any Discover
-	}
-	n := a.disco.rr[cs.Capability]
-	a.disco.rr[cs.Capability] = n + 1
-	a.disco.mu.Unlock()
-	target := cands[n%len(cands)]
-
-	trace := TraceID(ctx)
-	if trace == "" || Lane(ctx) != target.Lane {
-		trace = NewID()
-	}
 	var rd io.Reader
 	if b, ok := cs.Body.([]byte); ok {
 		rd = bytes.NewReader(b)
@@ -171,34 +135,14 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 		}
 		rd = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(ctx, cs.Method, strings.TrimSuffix(target.EndpointBase, "/")+cs.Path, rd)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(HeaderTrace, trace)
-	if target.Lane != "" {
-		req.Header.Set(HeaderLane, target.Lane)
-	}
-	hc, err := a.appClient(target.AppID + "." + target.InstanceID)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := hc.Do(req)
+	resp, err := a.callDo(ctx, target, cs.Method, cs.Path, rd, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		ce := &CallError{Status: resp.StatusCode, Body: strings.TrimSpace(string(data))}
-		var wrap struct {
-			Error *core.Error `json:"error"`
-		}
-		if json.Unmarshal(data, &wrap) == nil && wrap.Error != nil {
-			ce.Code = wrap.Error.Code
-		}
-		return resp.StatusCode, ce
+		return resp.StatusCode, callError(resp.StatusCode, data)
 	}
 	if cs.Out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, cs.Out); err != nil {
@@ -206,6 +150,135 @@ func (a *App) Call(ctx context.Context, cs CallSpec) (int, error) {
 		}
 	}
 	return resp.StatusCode, nil
+}
+
+// Stream is the answer of App.Stream: the body is read as it comes and
+// must be closed.
+type Stream struct {
+	*http.Response
+	// Instance is the instance that answered.
+	Instance Instance
+	cancel   context.CancelFunc
+}
+
+// Close closes the body and ends the call.
+func (s *Stream) Close() error {
+	err := s.Body.Close()
+	s.cancel()
+	return err
+}
+
+// Stream makes a direct call like Call (same checks: declared in uses[],
+// found through discovery, the callee's certificate checked) for data too
+// large to hold in memory (Stage B-1e): body, when not nil, is sent as it
+// is read, header adds request headers (Range, Accept, Content-Type --
+// application/octet-stream unless given), and the answer comes back
+// unread. cs.Body and cs.Out are not used; cs.Timeout, when set, bounds the
+// whole call including reading the answer (0: only ctx bounds it). A
+// non-2xx answer is a *CallError.
+func (a *App) Stream(ctx context.Context, cs CallSpec, header http.Header, body io.Reader) (*Stream, error) {
+	target, err := a.callTarget(ctx, cs)
+	if err != nil {
+		return nil, err
+	}
+	var cancel context.CancelFunc
+	if cs.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cs.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	h := http.Header{"Content-Type": {"application/octet-stream"}}
+	for k, v := range header {
+		h[http.CanonicalHeaderKey(k)] = v
+	}
+	resp, err := a.callDo(ctx, target, cs.Method, cs.Path, body, h)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		cancel()
+		return nil, callError(resp.StatusCode, data)
+	}
+	return &Stream{Response: resp, Instance: target, cancel: cancel}, nil
+}
+
+func callError(status int, data []byte) *CallError {
+	ce := &CallError{Status: status, Body: strings.TrimSpace(string(data))}
+	var wrap struct {
+		Error *core.Error `json:"error"`
+	}
+	if json.Unmarshal(data, &wrap) == nil && wrap.Error != nil {
+		ce.Code = wrap.Error.Code
+	}
+	return ce
+}
+
+// callTarget picks the callee instance for cs.
+func (a *App) callTarget(ctx context.Context, cs CallSpec) (Instance, error) {
+	if !a.declares(cs.App, cs.Capability) {
+		return Instance{}, fmt.Errorf("heain-sdk: %s/%s %w", cs.App, cs.Capability, ErrNotDeclared)
+	}
+	var insts []Instance
+	if cs.Scope == ScopeZone {
+		zi, _, err := a.DiscoverZone(ctx, cs.Capability, cs.Version)
+		if err != nil {
+			return Instance{}, err
+		}
+		for _, z := range zi {
+			insts = append(insts, z.Instance)
+		}
+	} else {
+		var err error
+		if insts, err = a.Discover(ctx, cs.Capability, cs.Version); err != nil {
+			return Instance{}, err
+		}
+	}
+	var cands []Instance
+	for _, in := range insts {
+		if in.AppID == cs.App && in.Execution == "direct" && in.EndpointBase != "" && (cs.Instance == "" || in.InstanceID == cs.Instance) {
+			cands = append(cands, in)
+		}
+	}
+	if len(cands) == 0 {
+		return Instance{}, fmt.Errorf("heain-sdk: %s/%s: %w", cs.App, cs.Capability, ErrNoInstance)
+	}
+	a.disco.mu.Lock()
+	if a.disco.rr == nil {
+		a.disco.rr = map[string]int{} // a zone call can come before any Discover
+	}
+	n := a.disco.rr[cs.Capability]
+	a.disco.rr[cs.Capability] = n + 1
+	a.disco.mu.Unlock()
+	return cands[n%len(cands)], nil
+}
+
+// callDo sends one request to target (trace and lane headers set; the
+// Content-Type is JSON unless header says otherwise).
+func (a *App) callDo(ctx context.Context, target Instance, method, path string, body io.Reader, header http.Header) (*http.Response, error) {
+	trace := TraceID(ctx)
+	if trace == "" || Lane(ctx) != target.Lane {
+		trace = NewID()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(target.EndpointBase, "/")+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range header {
+		req.Header[k] = v
+	}
+	req.Header.Set(HeaderTrace, trace)
+	if target.Lane != "" {
+		req.Header.Set(HeaderLane, target.Lane)
+	}
+	hc, err := a.appClient(target.AppID + "." + target.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	return hc.Do(req)
 }
 
 func (a *App) declares(app, capability string) bool {
