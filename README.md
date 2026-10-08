@@ -263,3 +263,14 @@ Stage B-1e (2026-10-08), large data by reference:
 - `App.Stream(ctx, CallSpec, header, body)`: a direct call with the same checks as `Call`, streamed both ways -- the request body is sent as it is read, request headers such as `Range` pass through, and the answer comes back unread (`*Stream`, with the `Instance` that answered; close it). `CallSpec.Timeout` bounds the whole call when set; otherwise only the context does.
 - `heain.StreamBody(w)`, called by a handler before it writes, sends the answer as it is written instead of after the handler returns; the formal audit event is written at the first byte or status (detail `streamed: true`), and if it cannot be the caller gets 503 `audit_unavailable` and nothing else. Used by heain-files for file content.
 - Conformance C11: after core restarts, the suite waits until the companions are discoverable again before calling the app.
+
+## Apps as container images in the conformance suite (CineNexus Pro case study, step 2a, 2026-10-09)
+
+Docker stays optional (author decision 2026-10-06): an app may start with any command. An app packaged as an image can also let the suite run the image itself, so the host actions keep their meaning inside a container:
+
+- **`conformance.yaml` (or any file named with `--conf`)** may hold `container: {image, dockerfile, context, run_args}`. With `dockerfile` the suite builds the image from the app directory after `build`; without it the image must exist. `start`, when given, overrides the image's command.
+- **How the suite runs it:** `<engine> run --rm --init --network host --user <uid>:<gid>`, the work directory mounted at the same path (every `HEAIN_*` path stays valid), `HEAIN_*` passed by name, a path outside the work directory (a companion's manifest) mounted read-only.
+- **Host actions:** SIGTERM and SIGKILL become `kill`; SIGSTOP and SIGCONT become `pause` and `unpause` (a stopped `docker run` client would not freeze the app).
+- **Shared engines:** every container carries `heain.conformance=<pid>` and is removed when the run ends; nothing else on the engine is touched.
+- **Engine:** `docker`, or `HEAIN_CONTAINER_ENGINE=podman`.
+- **Example:** heain-agent `examples/python-ref` with `conformance.docker.yaml`: `heain-conformance run --app examples/python-ref --conf conformance.docker.yaml`.

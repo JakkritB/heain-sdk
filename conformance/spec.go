@@ -22,8 +22,12 @@ type Conf struct {
 	// Start runs the app in the foreground, in the app directory, with the
 	// HEAIN_* variables of the container contract set (heain.StartFromEnv).
 	// Any command: a binary, an interpreter, or `docker run ...` if the
-	// developer packages the app that way.
-	Start []string `yaml:"start" json:"start"`
+	// developer packages the app that way. With Container set, Start is
+	// optional: when given, it overrides the image's command.
+	Start []string `yaml:"start,omitempty" json:"start,omitempty"`
+	// Container runs the app as a container image (Docker or Podman), the
+	// suite mapping its host actions onto the container (container.go).
+	Container *Container `yaml:"container,omitempty" json:"container,omitempty"`
 	// Port the app serves its direct endpoints on (HEAIN_LISTEN).
 	Port int `yaml:"port,omitempty" json:"port,omitempty"`
 	// DataDirs the app persists to besides HEAIN_STATE_DIR (relative to
@@ -54,6 +58,8 @@ type Dep struct {
 	Manifest string   `json:"manifest"`
 	Build    []string `json:"build,omitempty"`
 	Start    []string `json:"start"`
+	// Container: the companion runs as this image (its own conformance.yaml).
+	Container *Container `json:"container,omitempty"`
 }
 
 // Call is one request to the app under test.
@@ -89,16 +95,20 @@ type P7Case struct {
 }
 
 // LoadConf reads <dir>/conformance.yaml.
-func LoadConf(dir string) (Conf, error) {
+func LoadConf(dir string) (Conf, error) { return LoadConfFile(dir, "conformance.yaml") }
+
+// LoadConfFile reads <dir>/<name>, for example conformance.docker.yaml
+// next to conformance.yaml when an app is tested both ways.
+func LoadConfFile(dir, name string) (Conf, error) {
 	var c Conf
-	raw, err := os.ReadFile(filepath.Join(dir, "conformance.yaml"))
+	raw, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
 		return c, err
 	}
 	dec := yaml.NewDecoder(bytesReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
-		return c, fmt.Errorf("conformance.yaml: %w", err)
+		return c, fmt.Errorf("%s: %w", name, err)
 	}
 	if c.Manifest == "" {
 		c.Manifest = "heain-app.yaml"
@@ -106,8 +116,11 @@ func LoadConf(dir string) (Conf, error) {
 	if c.Port == 0 {
 		c.Port = 19443
 	}
-	if len(c.Start) == 0 {
-		return c, fmt.Errorf("conformance.yaml: start (the command that runs the app) is required")
+	if c.Container != nil && c.Container.Image == "" {
+		return c, fmt.Errorf("%s: container.image is required", name)
+	}
+	if len(c.Start) == 0 && c.Container == nil {
+		return c, fmt.Errorf("%s: start (the command that runs the app) or container is required", name)
 	}
 	return c, nil
 }

@@ -22,12 +22,14 @@ import (
 
 // RunOptions configure `heain-conformance run`.
 type RunOptions struct {
-	AppDir  string   // the app under test (conformance.yaml, manifest, its own build/start commands)
-	CoreDir string   // heain-core source
-	OutDir  string   // where report.json, report.txt and the logs are copied
-	Phases  []string // single, offline
-	Keep    bool     // keep the work directory
-	Log     io.Writer
+	AppDir string // the app under test (conformance.yaml, manifest, its own build/start commands)
+	// ConfFile is the conformance file in AppDir (default conformance.yaml).
+	ConfFile string
+	CoreDir  string   // heain-core source
+	OutDir   string   // where report.json, report.txt and the logs are copied
+	Phases   []string // single, offline
+	Keep     bool     // keep the work directory
+	Log      io.Writer
 }
 
 type runner struct {
@@ -47,18 +49,23 @@ type runner struct {
 }
 
 type proc struct {
-	name string
-	cmd  *exec.Cmd
-	done chan struct{}
-	out  *bytes.Buffer
-	mu   sync.Mutex
+	name      string
+	container string // set when the process is `<engine> run` of this container
+	cmd       *exec.Cmd
+	done      chan struct{}
+	out       *bytes.Buffer
+	mu        sync.Mutex
 }
 
 // Run builds heain-core and the app, runs the phases and returns the report.
 func Run(ctx context.Context, o RunOptions) (*Report, error) {
 	r := &runner{o: o}
 	var err error
-	if r.conf, err = LoadConf(o.AppDir); err != nil {
+	if o.ConfFile == "" {
+		o.ConfFile = "conformance.yaml"
+		r.o.ConfFile = o.ConfFile
+	}
+	if r.conf, err = LoadConfFile(o.AppDir, o.ConfFile); err != nil {
 		return nil, err
 	}
 	if r.work, err = os.MkdirTemp("", "heain-conformance-"); err != nil {
@@ -70,6 +77,7 @@ func Run(ctx context.Context, o RunOptions) (*Report, error) {
 			return nil, err
 		}
 	}
+	defer r.removeContainers()
 	r.lanIP = lanAddress()
 	r.logf("work directory %s", r.work)
 	if err := r.build(ctx); err != nil {
@@ -134,6 +142,11 @@ func (r *runner) build(ctx context.Context) error {
 			return fmt.Errorf("app build: %v\n%s", err, out)
 		}
 	}
+	if r.conf.Container != nil {
+		if err := r.buildImage(ctx, r.o.AppDir, r.conf.Container); err != nil {
+			return err
+		}
+	}
 	copyFile(filepath.Join(r.o.AppDir, r.conf.Manifest), filepath.Join(r.shared, "app", "heain-app.yaml"))
 	for i, cd := range r.conf.Companions {
 		dir := filepath.Join(r.o.AppDir, cd)
@@ -155,8 +168,13 @@ func (r *runner) build(ctx context.Context) error {
 				return fmt.Errorf("companion %s build: %v\n%s", cd, err, out)
 			}
 		}
+		if cc.Container != nil {
+			if err := r.buildImage(ctx, dir, cc.Container); err != nil {
+				return fmt.Errorf("companion %s: %w", cd, err)
+			}
+		}
 		r.conf.Deps = append(r.conf.Deps, Dep{Dir: dir, AppID: m.App.ID, Instance: fmt.Sprintf("d%d", i+1), Port: r.conf.Port + 10 + i,
-			Manifest: filepath.Join(dir, cc.Manifest), Start: cc.Start})
+			Manifest: filepath.Join(dir, cc.Manifest), Start: cc.Start, Container: cc.Container})
 	}
 	raw, _ := json.Marshal(r.conf)
 	return os.WriteFile(filepath.Join(r.shared, "app", "conformance.json"), raw, 0o644)
@@ -188,6 +206,19 @@ func lanAddress() string {
 }
 
 // ---- processes ----
+
+// spawnApp starts an app: its start command, or its container image.
+func (r *runner) spawnApp(name, dir string, env []string, start []string, c *Container) (*proc, error) {
+	if c == nil {
+		return r.spawn(name, dir, env, start)
+	}
+	args, cn := r.containerArgs(name, c, env, start)
+	p, err := r.spawn(name, dir, env, args)
+	if p != nil {
+		p.container = cn
+	}
+	return p, err
+}
 
 func (r *runner) spawn(name, dir string, env []string, args []string) (*proc, error) {
 	cmd := exec.Command(args[0], args[1:]...)
@@ -221,9 +252,16 @@ func (l *lockedWriter) Write(b []byte) (int, error) {
 }
 
 func (p *proc) signal(s syscall.Signal) {
-	if p != nil && p.cmd.Process != nil {
-		_ = syscall.Kill(-p.cmd.Process.Pid, s)
+	if p == nil || p.cmd.Process == nil {
+		return
 	}
+	if p.container != "" {
+		containerSignal(p.container, s)
+		if s != syscall.SIGKILL {
+			return // the engine client exits when the container does
+		}
+	}
+	_ = syscall.Kill(-p.cmd.Process.Pid, s)
 }
 
 func (p *proc) running() bool {
@@ -412,7 +450,7 @@ func (r *runner) action(action string, args map[string]string, appEnv []string) 
 		if r.app.running() {
 			return HostResult{OK: true}
 		}
-		p, err := r.spawn("app", r.o.AppDir, appEnv, r.conf.Start)
+		p, err := r.spawnApp("app", r.o.AppDir, appEnv, r.conf.Start, r.conf.Container)
 		if err != nil {
 			return HostResult{Out: err.Error(), Exit: 1}
 		}
@@ -424,7 +462,7 @@ func (r *runner) action(action string, args map[string]string, appEnv []string) 
 			env := append(append([]string{}, appEnv...), "HEAIN_MANIFEST="+dp.Manifest, "HEAIN_INSTANCE="+dp.Instance,
 				"HEAIN_STATE_DIR="+r.dir(dp.Instance+"-state"), "HEAIN_ENROLL_TOKEN="+filepath.Join(r.shared, "enroll", dp.Instance+".json"),
 				"HEAIN_ENDPOINT_BASE=https://127.0.0.1:"+port, "HEAIN_LISTEN=127.0.0.1:"+port)
-			p, err := r.spawn(dp.AppID+"-"+dp.Instance, dp.Dir, env, dp.Start)
+			p, err := r.spawnApp(dp.AppID+"-"+dp.Instance, dp.Dir, env, dp.Start, dp.Container)
 			if err != nil {
 				return HostResult{Out: err.Error(), Exit: 1}
 			}
@@ -443,7 +481,7 @@ func (r *runner) action(action string, args map[string]string, appEnv []string) 
 	case "app_broken":
 		env := append(append([]string{}, appEnv...), "HEAIN_MANIFEST="+args["manifest"], "HEAIN_INSTANCE=c1x",
 			"HEAIN_STATE_DIR="+r.dir("c1x"), "HEAIN_ENROLL_TOKEN="+filepath.Join(r.shared, "enroll", "none.json"), "HEAIN_ENROLL_WAIT=5s")
-		p, err := r.spawn("app-broken", r.o.AppDir, env, r.conf.Start)
+		p, err := r.spawnApp("app-broken", r.o.AppDir, env, r.conf.Start, r.conf.Container)
 		if err != nil {
 			return HostResult{Out: err.Error(), Exit: 1}
 		}

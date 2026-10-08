@@ -5,7 +5,8 @@
 //
 // It builds heain-core from source and starts its nodes as processes on
 // this machine, builds and starts the app with the commands in the app's
-// conformance.yaml -- any language or packaging; Docker is not required --
+// conformance.yaml -- any language or packaging: a host process, or a
+// container image (`container:`, Docker or Podman; Docker is optional) --
 // runs groups C1-C14 and writes report.json and report.txt. Exit code 0
 // means pass.
 package main
@@ -30,6 +31,7 @@ func main() {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	home, _ := os.UserHomeDir()
 	app := fs.String("app", "", "directory of the app under test (conformance.yaml and the manifest)")
+	conf := fs.String("conf", "conformance.yaml", "the conformance file in the app directory (e.g. conformance.docker.yaml)")
 	coreDir := fs.String("core", filepath.Join(home, "heain-core"), "heain-core source directory")
 	out := fs.String("out", "conformance-report", "where to write report.json, report.txt and the logs")
 	phases := fs.String("phases", "single,offline", "phases: single (C1-C9, C11-C14), offline (C10)")
@@ -41,7 +43,7 @@ func main() {
 	abs := func(p string) string { a, _ := filepath.Abs(p); return a }
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	rep, err := conformance.Run(ctx, conformance.RunOptions{AppDir: abs(*app), CoreDir: abs(*coreDir), OutDir: abs(*out),
+	rep, err := conformance.Run(ctx, conformance.RunOptions{AppDir: abs(*app), ConfFile: *conf, CoreDir: abs(*coreDir), OutDir: abs(*out),
 		Phases: strings.Split(*phases, ","), Keep: *keep, Log: os.Stdout})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "heain-conformance:", err)
@@ -55,6 +57,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: heain-conformance run --app DIR [--core DIR] [--out DIR] [--phases single,offline] [--keep]")
+	fmt.Fprintln(os.Stderr, "usage: heain-conformance run --app DIR [--conf FILE] [--core DIR] [--out DIR] [--phases single,offline] [--keep]")
 	os.Exit(2)
 }
