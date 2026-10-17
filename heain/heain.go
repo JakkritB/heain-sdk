@@ -29,7 +29,7 @@ import (
 // SDK identity, checked against the manifest's app.sdk.
 const (
 	SDKName    = "heain-sdk-go"
-	SDKVersion = "1.1.0"
+	SDKVersion = "1.2.0"
 	// AgentName is heain-agent, the sidecar that runs this SDK for an app
 	// in another language (Step 5, 2026-10-08): its manifests name it.
 	AgentName    = "heain-agent"

@@ -39,6 +39,10 @@ type AuditRecord struct {
 	Hash       string     `json:"hash"`
 	Ciphertext []byte     `json:"ciphertext_b64"`
 	Event      AuditEvent `json:"event"`
+	// Pruned (heain-core C3): the record's content was deleted under the
+	// node's retention policy; only its link (PrevHash, Hash), time, category
+	// and action are left, and its hash can no longer be recomputed.
+	Pruned bool `json:"pruned,omitempty"`
 }
 
 // AuditPage is one read of the chain and the node's head at that moment.
@@ -74,8 +78,8 @@ func AuditChainHash(prev []byte, seq uint64, ciphertext []byte) []byte {
 var ErrAuditChain = errors.New("heain-sdk: audit chain does not verify")
 
 // VerifyAuditRecords checks that recs follow prevHash (hex; "" or 64
-// zeros for genesis) and each other, recomputing every hash. It returns
-// the hash of the last record.
+// zeros for genesis) and each other, recomputing every hash (a pruned
+// record's link only). It returns the hash of the last record.
 func VerifyAuditRecords(prevHash string, recs []AuditRecord) (string, error) {
 	prev, err := hex.DecodeString(prevHash)
 	if err != nil || (len(prev) != 0 && len(prev) != sha256.Size) {
@@ -87,6 +91,14 @@ func VerifyAuditRecords(prevHash string, recs []AuditRecord) (string, error) {
 	for _, r := range recs {
 		if r.PrevHash != hex.EncodeToString(prev) {
 			return "", fmt.Errorf("%w: seq %d does not follow the previous record", ErrAuditChain, r.Seq)
+		}
+		if r.Pruned && len(r.Ciphertext) == 0 { // heain-core C3: only the link is left
+			h, err := hex.DecodeString(r.Hash)
+			if err != nil || len(h) != sha256.Size {
+				return "", fmt.Errorf("%w: seq %d (pruned) has no valid hash", ErrAuditChain, r.Seq)
+			}
+			prev = h
+			continue
 		}
 		h := AuditChainHash(prev, r.Seq, r.Ciphertext)
 		if r.Hash != hex.EncodeToString(h) {

@@ -286,3 +286,10 @@ Docker stays optional (author decision 2026-10-06): an app may start with any co
   - An app without a safety capability never accepts an expired certificate.
   - The core API also gives `App.CoreExpiredTolerance()`, `core.Client.SetExpiredTolerance` and `core.VerifyCore`.
 - **SDK version:** `SDKVersion` is now 1.1.0. Manifests that require `>=1.0.0` still accept it.
+
+## v1.2: pruned audit records (heain-core C3, 2026-10-17)
+
+- **Pruned records:** core can now delete the content of old audit records under `audit.retention`. A pruned record keeps its link (`seq`, `prev_hash`, `hash`) and its time, category and action, and comes with `"pruned": true`.
+- **What the SDK does:** `VerifyAuditRecords` accepts a pruned record by its link: its `prev_hash` must be the previous record's hash, and its hash becomes the next record's `prev_hash`. Its content cannot be checked, because it is gone. `AuditRecord.Pruned` says which records these are.
+- **Everything else is unchanged:** a record without the marker whose content does not match its hash is still refused.
+- **SDK version:** `SDKVersion` is now 1.2.0. Manifests that require `>=1.0.0` still accept it.
