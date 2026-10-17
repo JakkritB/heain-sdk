@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,20 +39,47 @@ type Client struct {
 	hc   *http.Client
 	lp   *http.Client // long polls: no client timeout, bounded by ctx
 	cfg  Config
+
+	tolerance atomic.Int64 // nanoseconds core's expired certificate is still accepted (0 = never)
+	// OnExpiredCore is told when core's expired certificate is accepted
+	// (within the tolerance); the SDK logs it.
+	OnExpiredCore func(notAfter time.Time)
+	expiredSeen   atomic.Int64 // NotAfter (unix) last reported
 }
 
 // New builds a client. It fails if the certificate files cannot be loaded.
 func New(cfg Config) (*Client, error) {
-	tc, err := TLSConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, cfg.NodeID)
+	c := &Client{base: strings.TrimSuffix(cfg.URL, "/"), cfg: cfg}
+	tc, err := tlsConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, cfg.NodeID, c.ExpiredTolerance, c.noteExpired)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Timeout == 0 {
-		cfg.Timeout = 30 * time.Second
+		c.cfg.Timeout = 30 * time.Second
 	}
 	tr := &http.Transport{TLSClientConfig: tc}
-	return &Client{base: strings.TrimSuffix(cfg.URL, "/"), cfg: cfg,
-		hc: &http.Client{Timeout: cfg.Timeout, Transport: tr}, lp: &http.Client{Transport: tr}}, nil
+	c.hc, c.lp = &http.Client{Timeout: c.cfg.Timeout, Transport: tr}, &http.Client{Transport: tr}
+	return c, nil
+}
+
+// SetExpiredTolerance sets how long after it expires core's certificate is
+// still accepted (heain-core C2, a zone cut off for long): core tells an app
+// with a safety capability (Registration.Safety) while its certificate still
+// verifies; 0 = never (the default).
+func (c *Client) SetExpiredTolerance(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	c.tolerance.Store(int64(d))
+}
+
+// ExpiredTolerance is the tolerance in force.
+func (c *Client) ExpiredTolerance() time.Duration { return time.Duration(c.tolerance.Load()) }
+
+func (c *Client) noteExpired(notAfter time.Time) {
+	if c.expiredSeen.Swap(notAfter.Unix()) != notAfter.Unix() && c.OnExpiredCore != nil {
+		c.OnExpiredCore(notAfter)
+	}
 }
 
 // TLSConfig is the client side of the SDK's mTLS: TLS 1.3 only, the given
@@ -66,6 +94,72 @@ func TLSConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, error
 		return nil, err
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}, RootCAs: pool, ServerName: serverName}, nil
+}
+
+// NodeCertOU marks a short-lived node certificate (heain-core's node-issuing CA).
+const NodeCertOU = "heain-node"
+
+// tlsConfig is TLSConfig whose peer check is done here instead of by
+// crypto/tls -- the same checks (the chain to the CA at the current time,
+// server authentication, serverName) -- so that core's short-lived node
+// certificate may still be accepted for up to tolerance() after it expired
+// (heain-core C2: core's zone cut off from the issuer for long). Nothing else
+// is relaxed: the chain must verify at its last valid second.
+func tlsConfig(certFile, keyFile, caFile, serverName string, tolerance func() time.Duration, expired func(time.Time)) (*tls.Config, error) {
+	tc, err := TLSConfig(certFile, keyFile, caFile, serverName)
+	if err != nil {
+		return nil, err
+	}
+	pool := tc.RootCAs
+	tc.InsecureSkipVerify = true // replaced by VerifyConnection (the same checks)
+	tc.VerifyConnection = func(cs tls.ConnectionState) error {
+		return VerifyCore(cs.PeerCertificates, pool, cs.ServerName, time.Now(), tolerance(), expired)
+	}
+	return tc, nil
+}
+
+// VerifyCore verifies core's certificate chain (leaf first) as crypto/tls
+// would, except that a short-lived node certificate expired for at most
+// tolerance is accepted when it verifies at its last valid second
+// (expired, if set, is told).
+func VerifyCore(certs []*x509.Certificate, pool *x509.CertPool, name string, now time.Time, tolerance time.Duration, expired func(time.Time)) error {
+	if len(certs) == 0 {
+		return errors.New("heain-sdk: core sent no certificate")
+	}
+	if name == "" {
+		return errors.New("heain-sdk: no core node id to verify its certificate against")
+	}
+	inter := x509.NewCertPool()
+	for _, c := range certs[1:] {
+		inter.AddCert(c)
+	}
+	opts := x509.VerifyOptions{Roots: pool, Intermediates: inter, CurrentTime: now, DNSName: name, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	_, err := certs[0].Verify(opts)
+	if err == nil {
+		return nil
+	}
+	leaf := certs[0]
+	var inv x509.CertificateInvalidError
+	if tolerance <= 0 || !errors.As(err, &inv) || inv.Reason != x509.Expired || !now.After(leaf.NotAfter) || now.Sub(leaf.NotAfter) > tolerance || !hasOU(leaf, NodeCertOU) {
+		return &tls.CertificateVerificationError{UnverifiedCertificates: certs, Err: err}
+	}
+	opts.CurrentTime = leaf.NotAfter.Add(-time.Second)
+	if _, err2 := leaf.Verify(opts); err2 != nil {
+		return &tls.CertificateVerificationError{UnverifiedCertificates: certs, Err: err}
+	}
+	if expired != nil {
+		expired(leaf.NotAfter)
+	}
+	return nil
+}
+
+func hasOU(c *x509.Certificate, ou string) bool {
+	for _, o := range c.Subject.OrganizationalUnit {
+		if o == ou {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadPool reads a PEM CA bundle.
@@ -182,11 +276,21 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 
 // Registration is the answer to register and heartbeat.
 type Registration struct {
-	RegistrationID     string `json:"registration_id"`
-	Status             string `json:"status"` // active | pending_approval | ...
-	HeartbeatIntervalS int    `json:"heartbeat_interval_s,omitempty"`
-	TTLS               int    `json:"ttl_s,omitempty"`
-	ActionID           string `json:"action_id,omitempty"`
+	RegistrationID     string  `json:"registration_id"`
+	Status             string  `json:"status"` // active | pending_approval | ...
+	HeartbeatIntervalS int     `json:"heartbeat_interval_s,omitempty"`
+	TTLS               int     `json:"ttl_s,omitempty"`
+	ActionID           string  `json:"action_id,omitempty"`
+	Safety             *Safety `json:"safety,omitempty"`
+}
+
+// Safety is what core tells an app with a safety capability (heain-core C2):
+// how long after it expires core's certificate may still be accepted
+// (security.safety_expired_max) and which of the app's capabilities are
+// safety duties (license.safety_capabilities). Absent: none.
+type Safety struct {
+	ExpiredMaxS  int      `json:"expired_max_s"`
+	Capabilities []string `json:"capabilities"`
 }
 
 // Register is POST /v1/app/register. manifest is sent as JSON.

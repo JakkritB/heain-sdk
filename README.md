@@ -274,3 +274,15 @@ Docker stays optional (author decision 2026-10-06): an app may start with any co
 - **Shared engines:** every container carries `heain.conformance=<pid>` and is removed when the run ends; nothing else on the engine is touched.
 - **Engine:** `docker`, or `HEAIN_CONTAINER_ENGINE=podman`.
 - **Example:** heain-agent `examples/python-ref` with `conformance.docker.yaml`: `heain-conformance run --app examples/python-ref --conf conformance.docker.yaml`.
+
+## v1.1: core's certificate expired while its zone is cut off (heain-core C2, 2026-10-17)
+
+- **What core tells an app:** in the answer to registration and every heartbeat, core may include `safety`, which carries `expired_max_s` (`security.safety_expired_max`) and the app's capabilities listed in `license.safety_capabilities`. Core includes it only for an app that has such a capability.
+- **What the SDK does with it:**
+  - It keeps the value in the state directory, so it survives a restart.
+  - When core's short-lived node certificate has expired, the SDK still accepts it for up to `expired_max_s` after it expired. This happens because the certificate cannot be renewed while the zone is cut off from the Primary.
+  - It accepts such a certificate only when the chain verifies at the certificate's last valid second, and logs every certificate it accepts this way.
+- **Everything else is unchanged:**
+  - An app without a safety capability never accepts an expired certificate.
+  - The core API also gives `App.CoreExpiredTolerance()`, `core.Client.SetExpiredTolerance` and `core.VerifyCore`.
+- **SDK version:** `SDKVersion` is now 1.1.0. Manifests that require `>=1.0.0` still accept it.

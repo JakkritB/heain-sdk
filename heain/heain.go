@@ -12,11 +12,13 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -27,7 +29,7 @@ import (
 // SDK identity, checked against the manifest's app.sdk.
 const (
 	SDKName    = "heain-sdk-go"
-	SDKVersion = "1.0.0"
+	SDKVersion = "1.1.0"
 	// AgentName is heain-agent, the sidecar that runs this SDK for an app
 	// in another language (Step 5, 2026-10-08): its manifests name it.
 	AgentName    = "heain-agent"
@@ -79,6 +81,8 @@ type App struct {
 	logf    func(string, ...any)
 	closed  bool
 
+	safetyFile string // C2: what core said about safety duties, kept for a restart
+
 	modeMu   sync.Mutex
 	mode     Mode
 	modeAt   time.Time
@@ -125,6 +129,12 @@ func Start(ctx context.Context, o Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.OnExpiredCore = func(at time.Time) {
+		logf("heain-sdk: core %s's certificate expired at %s; accepted for this app's safety duties (heain-core C2: the zone is cut off; security.safety_expired_max %s)",
+			o.Core.NodeID, at.UTC().Format(time.RFC3339), c.ExpiredTolerance())
+	}
+	safetyFile := filepath.Join(stateDirOf(o), fmt.Sprintf(".heain-%s.%s.safety", m.App.ID, o.InstanceID))
+	loadSafety(c, safetyFile, o.Core.NodeID) // a restart while cut off: what core said last
 	info, err := c.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("heain-sdk: core unreachable: %w", err)
@@ -147,7 +157,8 @@ func Start(ctx context.Context, o Options) (*App, error) {
 		return nil, err
 	}
 	a := &App{Manifest: m, Core: c, Instance: o.InstanceID, reg: reg, stop: make(chan struct{}), done: make(chan struct{}), logf: logf,
-		opts: o, pair: pair, key: pair.PrivateKey}
+		opts: o, pair: pair, key: pair.PrivateKey, safetyFile: safetyFile}
+	a.applySafety(reg.Safety)
 	logf("heain-sdk: %s registered with core %s (%s), status %s", want, info.NodeID, info.CoreVersion, reg.Status)
 	a.mode = Mode{Mode: ModeNormal}
 	if info.Mode != "" {
@@ -204,6 +215,7 @@ func (a *App) WaitActive(ctx context.Context) error {
 				a.mu.Lock()
 				a.reg.Status = r.Status
 				a.mu.Unlock()
+				a.applySafety(r.Safety)
 			}
 		}
 	}
@@ -231,8 +243,85 @@ func (a *App) heartbeat() {
 		a.mu.Lock()
 		a.reg.Status = r.Status
 		a.mu.Unlock()
+		a.applySafety(r.Safety)
 	}
 }
+
+// ---- heain-core C2: core's certificate expired while its zone is cut off ----
+
+func stateDirOf(o Options) string {
+	if o.StateDir != "" {
+		return o.StateDir
+	}
+	return filepath.Dir(o.Core.KeyFile)
+}
+
+type safetyState struct {
+	Core         string    `json:"core"`
+	ExpiredMaxS  int       `json:"expired_max_s"`
+	Capabilities []string  `json:"capabilities"`
+	At           time.Time `json:"at"`
+}
+
+// loadSafety applies what core said last (kept in the state directory), so
+// an app restarted while core's certificate is expired can reach it again.
+func loadSafety(c *core.Client, path, coreID string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var st safetyState
+	if json.Unmarshal(raw, &st) == nil && st.Core == coreID && st.ExpiredMaxS > 0 && len(st.Capabilities) > 0 {
+		c.SetExpiredTolerance(time.Duration(st.ExpiredMaxS) * time.Second)
+	}
+}
+
+// applySafety takes core's answer: the tolerance for core's expired
+// certificate (only an app with a safety capability is given one), kept for
+// a restart; none = never accept an expired certificate.
+func (a *App) applySafety(sf *core.Safety) {
+	var d time.Duration
+	if sf != nil && sf.ExpiredMaxS > 0 && len(sf.Capabilities) > 0 {
+		d = time.Duration(sf.ExpiredMaxS) * time.Second
+	}
+	if old := a.Core.ExpiredTolerance(); old != d {
+		if d > 0 {
+			a.logf("heain-sdk: core accepts %v as safety duties: its certificate may be accepted up to %s after it expires (heain-core C2)", sf.Capabilities, d)
+		}
+	}
+	a.Core.SetExpiredTolerance(d)
+	a.mu.Lock()
+	a.reg.Safety = sf
+	a.mu.Unlock()
+	if a.safetyFile == "" {
+		return
+	}
+	if d <= 0 {
+		_ = os.Remove(a.safetyFile)
+		return
+	}
+	raw, _ := json.Marshal(safetyState{Core: a.opts.Core.NodeID, ExpiredMaxS: sf.ExpiredMaxS, Capabilities: sf.Capabilities, At: time.Now().UTC()})
+	if cur, err := os.ReadFile(a.safetyFile); err == nil && sameSafety(cur, raw) {
+		return
+	}
+	tmp := a.safetyFile + ".tmp"
+	if os.WriteFile(tmp, raw, 0o600) == nil {
+		_ = os.Rename(tmp, a.safetyFile)
+	}
+}
+
+func sameSafety(a, b []byte) bool {
+	var x, y safetyState
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+		return false
+	}
+	return x.Core == y.Core && x.ExpiredMaxS == y.ExpiredMaxS && fmt.Sprint(x.Capabilities) == fmt.Sprint(y.Capabilities)
+}
+
+// CoreExpiredTolerance is how long after it expired core's certificate (or
+// one of core's signing certificates) this app accepts it (heain-core C2);
+// 0 = never.
+func (a *App) CoreExpiredTolerance() time.Duration { return a.Core.ExpiredTolerance() }
 
 // Close stops the heartbeat and deregisters (graceful leave).
 func (a *App) Close(ctx context.Context) error {
