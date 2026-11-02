@@ -25,6 +25,7 @@ import (
 type fake2 struct {
 	mu      sync.Mutex
 	revoked map[string]bool
+	unknown map[string]bool // heain-core C13: core cannot check this serial now
 	events  []map[string]any
 	records []map[string]any
 	disco   map[string][]Instance
@@ -49,7 +50,12 @@ func (f *fake2) h(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 		_, _ = w.Write([]byte(`{"record_id":"` + body["record_id"].(string) + `"}`))
 	case strings.HasPrefix(r.URL.Path, "/v1/app/certs/"):
-		valid := !f.revoked[strings.TrimPrefix(r.URL.Path, "/v1/app/certs/")]
+		serial := strings.TrimPrefix(r.URL.Path, "/v1/app/certs/")
+		if f.unknown[serial] {
+			_ = json.NewEncoder(w).Encode(map[string]any{"valid": false, "known": false, "reason": "upward_unreachable"})
+			return
+		}
+		valid := !f.revoked[serial]
 		_ = json.NewEncoder(w).Encode(map[string]any{"valid": valid})
 	case r.URL.Path == "/v1/app/public/statements": // C11 S2
 		if body["kind"] == "forbidden.kind" {
@@ -332,5 +338,33 @@ func TestRevokedPeers(t *testing.T) {
 	e.caller.clients = sync.Map{} // new connection, so the callee is checked again
 	if _, err := e.caller.Call(ctx, spec); err == nil || !strings.Contains(err.Error(), "certificate_revoked") {
 		t.Fatalf("a revoked callee must be refused by the caller: %v", err)
+	}
+}
+
+// heain-core C13: a peer whose certificate core cannot check now is refused as
+// "unavailable" (503 revocation_unavailable), not as "revoked".
+func TestUnverifiablePeers(t *testing.T) {
+	e := startEnv(t)
+	RevocationTTL = 0
+	defer func() { RevocationTTL = 10 * time.Second }()
+	c, _ := x509.ParseCertificate(e.caller.pair.Certificate[0])
+	ctx := context.Background()
+	spec := CallSpec{App: "svc-app", Capability: "svc.greet", Method: "POST", Path: "/v1/greet"}
+	e.f.mu.Lock()
+	e.f.unknown = map[string]bool{c.SerialNumber.String(): true}
+	e.f.mu.Unlock()
+	_, err := e.caller.Call(ctx, spec)
+	var ce *CallError
+	if !errors.As(err, &ce) || ce.Code != "revocation_unavailable" {
+		t.Fatalf("a caller core cannot check now must be refused as unavailable: %v", err)
+	}
+	if err := e.svc.checkPeer(ctx, c); !errors.Is(err, core.ErrCertUnverifiable) || errors.Is(err, ErrRevoked) {
+		t.Fatalf("checkPeer: %v", err)
+	}
+	e.f.mu.Lock()
+	e.f.unknown = nil
+	e.f.mu.Unlock()
+	if _, err := e.caller.Call(ctx, spec); err != nil {
+		t.Fatalf("checked again once core can answer (not cached): %v", err)
 	}
 }

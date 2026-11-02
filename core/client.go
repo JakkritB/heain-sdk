@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,7 +41,8 @@ type Client struct {
 	lp   *http.Client // long polls: no client timeout, bounded by ctx
 	cfg  Config
 
-	tolerance atomic.Int64 // nanoseconds core's expired certificate is still accepted (0 = never)
+	tolerance    atomic.Int64 // nanoseconds core's expired certificate is still accepted (0 = never)
+	unverRetries atomic.Int64 // retries of a 503 cert_unverifiable (heain-core C13; 0 = none, the default)
 	// OnExpiredCore is told when core's expired certificate is accepted
 	// (within the tolerance); the SDK logs it.
 	OnExpiredCore func(notAfter time.Time)
@@ -71,6 +73,17 @@ func (c *Client) SetExpiredTolerance(d time.Duration) {
 		d = 0
 	}
 	c.tolerance.Store(int64(d))
+}
+
+// SetCertUnverifiableRetries sets how many times a call answered 503
+// cert_unverifiable (heain-core C13: core cannot check the app's certificate
+// now) is sent again, each after the Retry-After core gave (bounded by the
+// call's context). 0 (the default) returns the error at once.
+func (c *Client) SetCertUnverifiableRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.unverRetries.Store(int64(n))
 }
 
 // ExpiredTolerance is the tolerance in force.
@@ -175,6 +188,15 @@ func LoadPool(caFile string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// CodeCertUnverifiable is the App API error code (503, retryable) of a core
+// that cannot check the app's certificate now: it cannot reach upward and has
+// no recent answer (heain-core C13). It is not "revoked": try again later.
+const CodeCertUnverifiable = "cert_unverifiable"
+
+// ErrCertUnverifiable matches (errors.Is) a 503 cert_unverifiable from core,
+// and the SDK's own "core cannot say now" about a peer's certificate.
+var ErrCertUnverifiable = errors.New("heain-sdk: core cannot check the app certificate now (cert_unverifiable)")
+
 // Error is the App API error body (spec 00 error format).
 type Error struct {
 	Status    int      `json:"-"`
@@ -182,6 +204,13 @@ type Error struct {
 	Message   string   `json:"message"`
 	Retryable bool     `json:"retryable"`
 	Reasons   []string `json:"reasons,omitempty"`
+	// RetryAfter is the response's Retry-After (0 when none).
+	RetryAfter time.Duration `json:"-"`
+}
+
+// Is lets errors.Is(err, ErrCertUnverifiable) match a 503 cert_unverifiable.
+func (e *Error) Is(target error) bool {
+	return target == ErrCertUnverifiable && e.Code == CodeCertUnverifiable
 }
 
 func (e *Error) Error() string {
@@ -212,12 +241,34 @@ func (c *Client) LongPoll(ctx context.Context, method, path string, body, out an
 }
 
 func (c *Client) do(hc *http.Client, ctx context.Context, method, path string, hdr http.Header, body, out any) (int, error) {
-	var rd io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
 			return 0, err
 		}
+	}
+	for try := int64(0); ; try++ {
+		st, err := c.do1(hc, ctx, method, path, hdr, body != nil, raw, out)
+		var e *Error
+		if !errors.As(err, &e) || e.Code != CodeCertUnverifiable || try >= c.unverRetries.Load() {
+			return st, err
+		}
+		wait := e.RetryAfter
+		if wait <= 0 {
+			wait = 30 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return st, err
+		case <-time.After(wait):
+		}
+	}
+}
+
+func (c *Client) do1(hc *http.Client, ctx context.Context, method, path string, hdr http.Header, hasBody bool, raw []byte, out any) (int, error) {
+	var rd io.Reader
+	if hasBody {
 		rd = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rd)
@@ -227,7 +278,7 @@ func (c *Client) do(hc *http.Client, ctx context.Context, method, path string, h
 	for k, v := range hdr {
 		req.Header[k] = v
 	}
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := hc.Do(req)
@@ -242,6 +293,9 @@ func (c *Client) do(hc *http.Client, ctx context.Context, method, path string, h
 		}
 		if json.Unmarshal(data, &wrap) == nil && wrap.Error != nil {
 			wrap.Error.Status = resp.StatusCode
+			if n, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && n > 0 {
+				wrap.Error.RetryAfter = time.Duration(n) * time.Second
+			}
 			return resp.StatusCode, wrap.Error
 		}
 		return resp.StatusCode, &Error{Status: resp.StatusCode, Code: "http_" + fmt.Sprint(resp.StatusCode), Message: strings.TrimSpace(string(data))}

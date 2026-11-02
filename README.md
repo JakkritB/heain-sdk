@@ -310,3 +310,11 @@ Some statements must be checkable by anyone, with no certificate: a lot's commit
 - `App.PublishStatement(ctx, capability, kind, content)` publishes one (JSON, at most 64 KB). Core accepts only a kind its `public.statements` (P5) lists for the app, only from a capability on a listed lane, never lane identity, within `per_hour`. A published statement cannot be taken back.
 - `heain.CheckPublicStatement(ctx, httpClient, base, seq, caPEM)` reads statement `seq` from a node's public listener (`-public-addr`, plain HTTP) and verifies it: the exact bytes hash to the leaf, the inclusion path leads to the head's root, the head is signed by the node's key whose certificate chains to `caPEM` and names the node. Get the CA from `GET /v1/public/ca` and compare its fingerprint with the one announced elsewhere.
 - `heain.VerifyPublicStatement(raw, inclusion, head, caPEM)` does the same on data already fetched. It reports whether the head carries a time-stamp; verifying the token itself is left to the caller (for example `openssl ts -verify`).
+
+## heain-sdk 1.5: "cannot check now" is not "revoked" (heain-core C13, 2026-11-01)
+
+A node of heain-core checks an app certificate it did not issue by asking upward. When it cannot ask and has no usable last answer, core 1.3 with C13 answers 503 `cert_unverifiable` (retryable) with `Retry-After`, not 403, and `GET /v1/app/certs/{serial}` says `"known": false`. The app is still refused (fail closed); it is told to wait, not that its certificate is bad.
+
+- `core.ErrCertUnverifiable`: `errors.Is(err, core.ErrCertUnverifiable)` matches such a refusal; `core.Error.RetryAfter` carries the wait.
+- `Client.SetCertUnverifiableRetries(n)`: send the call again up to n times, each after core's `Retry-After` (bounded by the call's context). Default 0: the error is returned at once.
+- A peer whose certificate core cannot check now is refused as `revocation_unavailable` (503), not `certificate_revoked`, and the answer is not cached.
