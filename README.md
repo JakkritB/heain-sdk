@@ -318,3 +318,11 @@ A node of heain-core checks an app certificate it did not issue by asking upward
 - `core.ErrCertUnverifiable`: `errors.Is(err, core.ErrCertUnverifiable)` matches such a refusal; `core.Error.RetryAfter` carries the wait.
 - `Client.SetCertUnverifiableRetries(n)`: send the call again up to n times, each after core's `Retry-After` (bounded by the call's context). Default 0: the error is returned at once.
 - A peer whose certificate core cannot check now is refused as `revocation_unavailable` (503), not `certificate_revoked`, and the answer is not cached.
+
+## heain-sdk 1.6: custodians of sealed data (heain-core C12, 2026-11-05)
+
+A seal policy of heain-core may name custodians: `seal.policies["<app>/<name>"].custodians = {"k": 3, "holders": [{"id", "cert_pem"}, ...]}`. Records sealed under it open only when k of the holders take part: core seals under a public key per scope, splits the private key k of n among the holders (each share encrypted to the holder's certificate) and wipes it. No node keeps a key that opens these records.
+
+- An app seals and opens as before (`App.Seal`, `App.OpenSealed`). The answer of `Seal` names the custodians; `OpenSealed` is refused 403 `custodians_short` until k holders have sent their shares for the grant.
+- `custody.Client.TakePart(ctx, grant, approve)` is a holder's part: it reads the holder's shares of the keys the grant covers from the node, decrypts them with the holder's key on its own machine, encrypts them again to that node (the key on the TLS connection) for that grant, sends them, and approves the grant when `approve` is set. A share sent for one grant opens nothing under another.
+- `heain-custodian` (cmd/heain-custodian) does the same from the command line: `heain-custodian -core https://node:8443 -server-name <node> -cert org-a.pem -key org-a.key -ca ca.pem -grant <action id>`.
